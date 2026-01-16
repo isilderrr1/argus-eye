@@ -1,0 +1,16 @@
+[project]
+name = "argus-eye"
+version = "0.1.0"
+description = "ARGUS: home desktop security+health monitoring (Linux-first)"
+requires-python = ">=3.10"
+dependencies = [
+  "typer",
+  "textual",
+  "pyyaml",
+]
+
+[project.scripts]
+argus = "argus.cli:app"
+
+[tool.ruff]
+line-length = 100
