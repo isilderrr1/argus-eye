@@ -1,32 +1,20 @@
 from __future__ import annotations
 
-from pathlib import Path
 import typer
 
-from argus import __version__
+from argus import __version__, paths
 
-app = typer.Typer(add_completion=False)
-
-# Percorsi (v1 semplice): in seguito li centralizziamo in un modulo "paths.py"
-STATE_DIR = Path.home() / ".local" / "share" / "argus"
-STATE_FILE = STATE_DIR / "state.txt"
-
-
-def ensure_state_dir() -> None:
-    """Crea la cartella di stato se non esiste."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+app = typer.Typer(add_completion=False, invoke_without_command=True)
 
 
 def set_state(value: str) -> None:
-    """Salva lo stato (RUNNING/STOPPED)."""
-    ensure_state_dir()
-    STATE_FILE.write_text(value.strip() + "\n", encoding="utf-8")
+    paths.ensure_dirs()
+    paths.state_file().write_text(value.strip() + "\n", encoding="utf-8")
 
 
 def get_state() -> str:
-    """Legge lo stato, default STOPPED."""
     try:
-        return STATE_FILE.read_text(encoding="utf-8").strip()
+        return paths.state_file().read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return "STOPPED"
 
@@ -36,16 +24,22 @@ def main(
     ctx: typer.Context,
     version: bool = typer.Option(False, "--version", help="Mostra versione ed esce"),
 ):
+    # Preparazione: crea cartelle standard (~/.config/argus, ~/.local/share/argus, reports/)
+    paths.ensure_dirs()
+
+    # Crea config.yaml al primo avvio (Milestone 1b)
+    from argus.config import ensure_config_exists
+    ensure_config_exists()
+
     if version:
         typer.echo(f"argus {__version__}")
         raise typer.Exit()
 
-    # Se l'utente scrive solo `argus` (nessun comando), apriamo la TUI
+    # Se l'utente scrive solo `argus`, apriamo la TUI
     if ctx.invoked_subcommand is None:
         from argus.tui import ArgusApp
         ArgusApp().run()
         raise typer.Exit()
-
 
 
 @app.command()
