@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: argus-eye
-Version: 0.1.0
-Summary: ARGUS: home desktop security+health monitoring (Linux-first)
-Requires-Python: >=3.10
-Requires-Dist: typer
-Requires-Dist: textual
-Requires-Dist: pyyaml
