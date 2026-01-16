@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typer
+from datetime import datetime
 
 from argus import __version__, paths, db
 
@@ -32,7 +33,6 @@ def fmt_seconds(sec: int) -> str:
 
 
 def set_state(value: str) -> None:
-    # stato del monitor nel DB (niente scadenza)
     db.set_flag("monitor_state", value, ttl_seconds=None)
 
 
@@ -48,13 +48,9 @@ def main(
     ctx: typer.Context,
     version: bool = typer.Option(False, "--version", help="Mostra versione ed esce"),
 ):
-    # Preparazione ambiente (cartelle standard)
     paths.ensure_dirs()
-
-    # Inizializza DB (crea tabelle se mancano)
     db.init_db()
 
-    # Crea config.yaml al primo avvio
     from argus.config import ensure_config_exists
     ensure_config_exists()
 
@@ -62,7 +58,6 @@ def main(
         typer.echo(f"argus {__version__}")
         raise typer.Exit()
 
-    # Se l'utente scrive solo `argus`, apriamo la TUI
     if ctx.invoked_subcommand is None:
         from argus.tui import ArgusApp
         ArgusApp().run()
@@ -73,20 +68,12 @@ def main(
 def status():
     """Mostra lo stato (RUNNING/STOPPED) + flag runtime."""
     state = get_state()
-
     mute_left = db.remaining_seconds("mute")
     maint_left = db.remaining_seconds("maintenance")
 
     typer.echo(f"STATE: {state}")
-    if mute_left is None:
-        typer.echo("MUTE: OFF")
-    else:
-        typer.echo(f"MUTE: ON ({fmt_seconds(mute_left)} rimanenti)")
-
-    if maint_left is None:
-        typer.echo("MAINTENANCE: OFF")
-    else:
-        typer.echo(f"MAINTENANCE: ON ({fmt_seconds(maint_left)} rimanenti)")
+    typer.echo("MUTE: OFF" if mute_left is None else f"MUTE: ON ({fmt_seconds(mute_left)} rimanenti)")
+    typer.echo("MAINTENANCE: OFF" if maint_left is None else f"MAINTENANCE: ON ({fmt_seconds(maint_left)} rimanenti)")
 
 
 @app.command()
@@ -117,3 +104,50 @@ def maintenance(duration: str = typer.Argument("30m", help="Esempio: 30m, 1h")):
     seconds = parse_duration(duration)
     db.set_flag("maintenance", "1", ttl_seconds=seconds)
     typer.echo(f"MAINTENANCE attivo per {duration}")
+
+
+@app.command()
+def events(last: int = typer.Option(10, "--last", "-n", help="Quanti eventi mostrare")):
+    """Mostra gli ultimi eventi (feed) dal DB."""
+    rows = db.list_events(limit=last)
+    if not rows:
+        typer.echo("Nessun evento nel DB.")
+        raise typer.Exit()
+
+    for r in rows:
+        ts = datetime.fromtimestamp(int(r["ts"])).strftime("%H:%M:%S")
+        code = r.get("code", "") or ""
+        sev = r.get("severity", "") or ""
+        msg = (r.get("message", "") or "").strip()
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        typer.echo(f"{ts}  {sev:<8} {code:<7} {msg}")
+
+
+@app.command()
+def demo(
+    n: int = typer.Option(5, "--n", help="Quanti eventi generare"),
+    kind: str = typer.Option("mix", "--kind", help="mix | sec | hea"),
+):
+    """Genera eventi finti per popolare il feed (studio/debug)."""
+    kind = kind.lower()
+    severities = ["INFO", "WARNING", "CRITICAL"]
+
+    for i in range(n):
+        sev = severities[i % len(severities)]
+        if kind in ("mix", "sec"):
+            db.add_event(
+                code="SEC-01",
+                severity=sev,
+                message=f"DEMO: SSH pattern simulato ({sev})",
+                entity="192.168.1.50",
+            )
+        if kind in ("mix", "hea"):
+            db.add_event(
+                code="HEA-02",
+                severity=sev,
+                message=f"DEMO: Temperatura simulata ({sev})",
+                entity="cpu0",
+            )
+
+    typer.echo(f"Creati eventi demo: n={n}, kind={kind}")

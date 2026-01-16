@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 from argus import paths
 
@@ -64,6 +64,9 @@ def init_db() -> None:
         conn.commit()
 
 
+# -------------------------
+# Runtime flags (state/mute/maintenance)
+# -------------------------
 def set_flag(key: str, value: str, ttl_seconds: Optional[int] = None) -> None:
     """Imposta una flag con scadenza opzionale."""
     expires_at = _now() + ttl_seconds if ttl_seconds is not None else None
@@ -121,3 +124,55 @@ def remaining_seconds(key: str) -> Optional[int]:
     if expires_at is None:
         return None
     return max(0, int(expires_at) - _now())
+
+
+# -------------------------
+# Events (feed)
+# -------------------------
+def add_event(
+    code: str,
+    severity: str,
+    message: str,
+    entity: str = "",
+    details_json: str = "",
+    is_active: int = 0,
+) -> int:
+    """
+    Inserisce un evento in tabella events.
+    Ritorna l'id dell'evento inserito.
+    """
+    init_db()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO events(ts, code, severity, message, entity, details_json, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (_now(), code, severity, message, entity, details_json, is_active),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_events(limit: int = 10) -> List[Dict[str, Any]]:
+    """Ritorna gli ultimi N eventi (più recenti prima)."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ts, code, severity, message, entity, is_active, ended_ts
+            FROM events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_events() -> None:
+    """Pulisce completamente la tabella events (solo per demo/test)."""
+    init_db()
+    with connect() as conn:
+        conn.execute("DELETE FROM events")
+        conn.commit()
