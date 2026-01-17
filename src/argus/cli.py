@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from argus import monitor
 import typer
 from datetime import datetime
 
@@ -151,3 +151,14 @@ def demo(
             )
 
     typer.echo(f"Creati eventi demo: n={n}, kind={kind}")
+
+@app.command()
+def run(
+    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
+):
+    """Esegue il monitor in foreground (SEC-01) leggendo i log reali."""
+    set_state("RUNNING")
+    try:
+        monitor.run_ssh_authlog(log_path=log_path)
+    finally:
+        set_state("STOPPED")
