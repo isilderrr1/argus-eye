@@ -1,27 +1,17 @@
 from __future__ import annotations
 
-import time  # <- Aggiungi questa riga
+import time
 import typer
 
 from argus import __version__, paths, db
 from argus.collectors.authlog import tail_file
+from argus.detectors.sec01_ssh import SshBruteForceDetector
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
+from argus.detectors.sec03_sudo import SudoActivityDetector
+from argus.monitor import run_authlog_security  # <-- import corretto
 
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
-
-
-def parse_duration(s: str) -> int:
-    """
-    Accetta: 10m, 30m, 1h, 2h
-    Ritorna secondi.
-    """
-    s = s.strip().lower()
-    if s.endswith("m") and s[:-1].isdigit():
-        return int(s[:-1]) * 60
-    if s.endswith("h") and s[:-1].isdigit():
-        return int(s[:-1]) * 3600
-    raise typer.BadParameter("Durata non valida. Usa formato tipo 10m o 1h.")
 
 
 def fmt_seconds(sec: int) -> str:
@@ -96,7 +86,7 @@ def stop():
 @app.command()
 def mute(duration: str = typer.Argument("10m", help="Esempio: 10m, 30m, 1h")):
     """Silenzia popup (solo CRITICAL) per un periodo."""
-    seconds = parse_duration(duration)
+    seconds = int(time.time()) + parse_duration(duration)
     db.set_flag("mute", "1", ttl_seconds=seconds)
     typer.echo(f"MUTE attivo per {duration}")
 
@@ -108,65 +98,6 @@ def maintenance(duration: str = typer.Argument("30m", help="Esempio: 30m, 1h")):
     db.set_flag("maintenance", "1", ttl_seconds=seconds)
     typer.echo(f"MAINTENANCE attivo per {duration}")
 
-
-@app.command()
-def events(last: int = typer.Option(10, "--last", "-n", help="Quanti eventi mostrare")):
-    """Mostra gli ultimi eventi (feed) dal DB."""
-    rows = db.list_events(limit=last)
-    if not rows:
-        typer.echo("Nessun evento nel DB.")
-        raise typer.Exit()
-
-    for r in rows:
-        ts = datetime.fromtimestamp(int(r["ts"])).strftime("%H:%M:%S")
-        code = r.get("code", "") or ""
-        sev = r.get("severity", "") or ""
-        msg = (r.get("message", "") or "").strip()
-        if len(msg) > 80:
-            msg = msg[:77] + "..."
-        typer.echo(f"{ts}  {sev:<8} {code:<7} {msg}")
-
-
-@app.command()
-def demo(
-    n: int = typer.Option(5, "--n", help="Quanti eventi generare"),
-    kind: str = typer.Option("mix", "--kind", help="mix | sec | hea"),
-):
-    """Genera eventi finti per popolare il feed (studio/debug)."""
-    kind = kind.lower()
-    severities = ["INFO", "WARNING", "CRITICAL"]
-
-    for i in range(n):
-        sev = severities[i % len(severities)]
-        if kind in ("mix", "sec"):
-            db.add_event(
-                code="SEC-01",
-                severity=sev,
-                message=f"DEMO: SSH pattern simulato ({sev})",
-                entity="192.168.1.50",
-            )
-        if kind in ("mix", "hea"):
-            db.add_event(
-                code="HEA-02",
-                severity=sev,
-                message=f"DEMO: Temperatura simulata ({sev})",
-                entity="cpu0",
-            )
-
-    typer.echo(f"Creati eventi demo: n={n}, kind={kind}")
-
-@app.command()
-def run(
-    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
-):
-    """Esegue il monitor in foreground (SEC-01) leggendo i log reali."""
-    set_state("RUNNING")
-    try:
-        monitor.run_ssh_authlog(log_path=log_path)
-    finally:
-        set_state("STOPPED")
-
-from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
 
 @app.command()
 def sec02(
@@ -184,9 +115,9 @@ def sec02(
         for line in tail_file(log_path, from_end=True):
             result = detector.handle_line(line)
             if result:
-                severity, ip, message = result
-                db.add_event(code="SEC-02", severity=severity, message=message, entity=ip)
-                typer.echo(f"[SEC-02] {severity:<8} {ip}  {message}")
+                severity, entity, message = result
+                db.add_event(code="SEC-02", severity=severity, message=message, entity=entity)
+                typer.echo(f"[SEC-02] {severity:<8} {entity}  {message}")
 
     except PermissionError:
         typer.echo(f"[argus] Permesso negato su {log_path}.")
@@ -196,3 +127,15 @@ def sec02(
         raise
     except KeyboardInterrupt:
         typer.echo("\n[argus] Stop richiesto dall'utente. (CTRL+C)")
+
+
+@app.command()
+def run(
+    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
+):
+    """Esegui il monitor in foreground (SEC-01) leggendo i log reali."""
+    set_state("RUNNING")
+    try:
+        run_authlog_security(log_path=log_path)  # <-- Chiama direttamente la funzione ora
+    finally:
+        set_state("STOPPED")
