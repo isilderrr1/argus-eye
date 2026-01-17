@@ -1,9 +1,12 @@
 from __future__ import annotations
-from argus import monitor
+
+import time  # <- Aggiungi questa riga
 import typer
-from datetime import datetime
 
 from argus import __version__, paths, db
+from argus.collectors.authlog import tail_file
+from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
+
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
@@ -162,3 +165,34 @@ def run(
         monitor.run_ssh_authlog(log_path=log_path)
     finally:
         set_state("STOPPED")
+
+from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
+
+@app.command()
+def sec02(
+    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
+):
+    """Esegui il detector SEC-02 (Success After Fails)"""
+    set_state("RUNNING")
+    detector = SshSuccessAfterFailsDetector()
+
+    try:
+        typer.echo(f"[argus] SEC-02 monitor (auth.log) -> {log_path}")
+        typer.echo("[argus] Premi CTRL+C per fermare.")
+        time.sleep(0.2)
+
+        for line in tail_file(log_path, from_end=True):
+            result = detector.handle_line(line)
+            if result:
+                severity, ip, message = result
+                db.add_event(code="SEC-02", severity=severity, message=message, entity=ip)
+                typer.echo(f"[SEC-02] {severity:<8} {ip}  {message}")
+
+    except PermissionError:
+        typer.echo(f"[argus] Permesso negato su {log_path}.")
+        typer.echo("[argus] Soluzione tipica su Ubuntu: aggiungi l'utente al gruppo 'adm':")
+        typer.echo("        sudo usermod -aG adm $USER")
+        typer.echo("        poi fai logout/login (o riavvia).")
+        raise
+    except KeyboardInterrupt:
+        typer.echo("\n[argus] Stop richiesto dall'utente. (CTRL+C)")
