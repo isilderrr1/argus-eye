@@ -5,25 +5,23 @@ import time
 from collections import deque
 from typing import Deque, Dict, Optional, Tuple
 
+from argus import db
+
 
 def _now() -> int:
     return int(time.time())
 
 
-# sudo command line tipica in auth.log:
-# sudo: antonio : TTY=pts/0 ; PWD=/home/antonio ; USER=root ; COMMAND=/usr/bin/apt update
 RE_SUDO_CMD = re.compile(
     r"sudo:\s+(?P<user>\S+)\s*:\s+TTY=(?P<tty>[^;]+)\s*;\s+PWD=(?P<pwd>[^;]+)\s*;\s+USER=(?P<runas>[^;]+)\s*;\s+COMMAND=(?P<cmd>.+)$",
     re.IGNORECASE,
 )
 
-# sudo auth failure (varia, quindi match “grezzo” + optional info)
 RE_SUDO_AUTH_FAIL = re.compile(
     r"sudo: pam_unix\(sudo:auth\): authentication failure",
     re.IGNORECASE,
 )
 
-# Pattern “alto rischio”
 CRIT_PATTERNS = [
     re.compile(r"/etc/sudoers(\b|\.d/)", re.IGNORECASE),
     re.compile(r"/etc/(passwd|shadow|group|gshadow)\b", re.IGNORECASE),
@@ -41,7 +39,6 @@ CRIT_PATTERNS = [
     re.compile(r"\bwget\b.*\|\s*(sh|bash)", re.IGNORECASE),
 ]
 
-# Pattern “medio rischio”
 WARN_PATTERNS = [
     re.compile(r"\b(bash|sh|zsh)\b", re.IGNORECASE),
     re.compile(r"\bsu\b", re.IGNORECASE),
@@ -53,7 +50,6 @@ WARN_PATTERNS = [
 
 
 def classify_sudo_command(cmd: str) -> str:
-    """Ritorna severità grezza: INFO / WARNING / CRITICAL."""
     for p in CRIT_PATTERNS:
         if p.search(cmd):
             return "CRITICAL"
@@ -68,16 +64,15 @@ class SudoActivityDetector:
     SEC-03: Sudo / Privilege activity.
 
     - Logga comandi sudo, classificando rischio
+    - INFO viene emesso solo se il comando è "first-seen" (novità)
     - Rileva molte auth failure sudo in breve tempo
     """
 
-    # soglie per sudo auth failure
     FAIL_WARN_WINDOW = 60
     FAIL_CRIT_WINDOW = 120
     FAIL_WARN_TH = 2
     FAIL_CRIT_TH = 4
 
-    # cooldown per non spammare eventi simili
     COOLDOWN_INFO = 30
     COOLDOWN_WARN = 60
     COOLDOWN_CRIT = 120
@@ -107,13 +102,9 @@ class SudoActivityDetector:
             q.popleft()
 
     def handle_line(self, line: str) -> Optional[Tuple[str, str, str]]:
-        """
-        Ritorna (severity, entity, message) oppure None.
-        entity: utente locale
-        """
         now = _now()
 
-        # 1) sudo auth failures (password errata ripetuta)
+        # 1) sudo auth failures
         if RE_SUDO_AUTH_FAIL.search(line):
             self.sudo_fail_ts.append(now)
             self._prune_deque(self.sudo_fail_ts, self.FAIL_CRIT_WINDOW, now)
@@ -134,7 +125,7 @@ class SudoActivityDetector:
                     return sev, "local", msg
             return None
 
-        # 2) sudo command execution
+        # 2) sudo command
         m = RE_SUDO_CMD.search(line)
         if not m:
             return None
@@ -147,14 +138,20 @@ class SudoActivityDetector:
 
         raw_sev = classify_sudo_command(cmd)
 
-        # fingerprint: utente + comando “normalizzato”
+        # fingerprint stabile
         cmd_norm = re.sub(r"\s+", " ", cmd)[:200]
         fp = f"{user}|{runas}|{cmd_norm}"
 
+        # ✅ NOVITÀ: INFO solo se first-seen
+        if raw_sev == "INFO":
+            is_new = db.first_seen_touch(f"sec03|{fp}")
+            if not is_new:
+                return None
+
+        # cooldown normale (vale per INFO/WARN/CRIT)
         if not self._emit_ok(fp, raw_sev, now):
             return None
 
-        # messaggio user-friendly
         short_cmd = cmd_norm
         if len(short_cmd) > 120:
             short_cmd = short_cmd[:117] + "..."

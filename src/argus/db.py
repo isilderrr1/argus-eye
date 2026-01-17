@@ -176,3 +176,36 @@ def clear_events() -> None:
     with connect() as conn:
         conn.execute("DELETE FROM events")
         conn.commit()
+
+
+# -------------------------
+# First seen (novità / dedupe)
+# -------------------------
+def first_seen_touch(key: str) -> bool:
+    """
+    Registra la chiave in first_seen.
+    Ritorna True se è la prima volta che la vediamo (NEW),
+    False se era già presente (già visto).
+    """
+    init_db()
+    now = _now()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT key FROM first_seen WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                "INSERT INTO first_seen(key, first_ts, last_ts, count) VALUES (?, ?, ?, 1)",
+                (key, now, now),
+            )
+            conn.commit()
+            return True
+
+        conn.execute(
+            "UPDATE first_seen SET last_ts = ?, count = count + 1 WHERE key = ?",
+            (now, key),
+        )
+        conn.commit()
+        return False
