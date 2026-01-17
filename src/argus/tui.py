@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ipaddress import ip_address
 from datetime import datetime
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static
@@ -42,6 +43,40 @@ def parse_sec03_key(key: str):
     _, user, runas, cmd = parts
     return (user, runas, cmd)
 
+def parse_sec04_key(key: str):
+    """
+    key salvata come: sec04|proto|host|port
+    """
+    parts = key.split("|")
+    if len(parts) < 4:
+        return ("?", "?", "?")
+    return (parts[1], parts[2], parts[3])
+
+
+def sec04_exposure(host: str):
+    """
+    Ritorna (icon, scope, severity) in base a dove è in ascolto la porta.
+    """
+    h = (host or "").strip().lower()
+
+    # wildcard / tutte le interfacce
+    if h in ("*", "0.0.0.0", "::"):
+        return ("🌍", "PUBLIC", "CRITICAL")
+
+    # loopback
+    if h in ("127.0.0.1", "::1", "localhost"):
+        return ("🔒", "LOCAL", "INFO")
+
+    # ip reale
+    try:
+        ip = ip_address(host)
+        if ip.is_private or ip.is_link_local or ip.is_loopback:
+            return ("🏠", "LAN", "WARNING")
+        return ("🌍", "PUBLIC", "CRITICAL")
+    except Exception:
+        # non parsabile: trattiamolo come LAN prudente
+        return ("🏠", "LAN?", "WARNING")
+
 
 class DashboardPanel(Static):
     """Dashboard testuale: runtime + feed ultimi eventi + novità SEC-03 (da SQLite)."""
@@ -77,6 +112,26 @@ class DashboardPanel(Static):
         lines.append("")
         lines.append(f"GLOBAL: {gstatus} | STATE: {state} | MUTE: {mute_txt} | MAINT: {maint_txt}")
         lines.append("")
+        # SEC-04: nuove porte in ascolto (first-seen di oggi)
+        sec04_new = db.list_first_seen(prefix="sec04|", since_ts=since, limit=5)
+        sec04_total_today = len(db.list_first_seen(prefix="sec04|", since_ts=since, limit=9999))
+
+        lines.append("")
+        lines.append(f"SEC-04 — Nuove porte in ascolto viste oggi: {sec04_total_today}")
+
+        if not sec04_new:
+            lines.append("  (nessuna novità oggi)")
+        else:
+            for row in sec04_new:
+                first_ts = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
+                proto, host, port = parse_sec04_key(row["key"])
+                icon, scope, sev = sec04_exposure(host)
+                count = int(row.get("count", 1))
+
+                lines.append(
+                    f"  {first_ts}  {icon} {sev:<8} {proto:<3}  {host}:{port:<5}  ({scope})  (x{count})"
+                )
+
 
         # Eventi
         lines.append("Ultimi eventi (max 10):")
