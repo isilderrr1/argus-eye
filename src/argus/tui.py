@@ -26,8 +26,25 @@ def global_status_from_events(events) -> str:
     return "CALM"
 
 
+def start_of_today_ts() -> int:
+    now = datetime.now()  # timezone locale della macchina
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.timestamp())
+
+
+def parse_sec03_key(key: str):
+    """
+    key salvata come: sec03|user|runas|cmd_norm
+    """
+    parts = key.split("|", 3)
+    if len(parts) < 4:
+        return ("?", "?", key)
+    _, user, runas, cmd = parts
+    return (user, runas, cmd)
+
+
 class DashboardPanel(Static):
-    """Dashboard testuale: runtime + feed ultimi eventi (da SQLite)."""
+    """Dashboard testuale: runtime + feed ultimi eventi + novità SEC-03 (da SQLite)."""
 
     def on_mount(self) -> None:
         self.refresh_all()
@@ -50,13 +67,19 @@ class DashboardPanel(Static):
         events = db.list_events(limit=10)
         gstatus = global_status_from_events(events)
 
+        # SEC-03: first-seen di oggi
+        since = start_of_today_ts()
+        sec03_new = db.list_first_seen(prefix="sec03|", since_ts=since, limit=5)
+        sec03_total_today = len(db.list_first_seen(prefix="sec03|", since_ts=since, limit=9999))
+
         lines = []
         lines.append("👁 ARGUS — Dashboard (SQLite)")
         lines.append("")
         lines.append(f"GLOBAL: {gstatus} | STATE: {state} | MUTE: {mute_txt} | MAINT: {maint_txt}")
         lines.append("")
-        lines.append("Ultimi eventi (max 10):")
 
+        # Eventi
+        lines.append("Ultimi eventi (max 10):")
         if not events:
             lines.append("  (nessun evento nel DB)")
         else:
@@ -68,6 +91,21 @@ class DashboardPanel(Static):
                 if len(msg) > 70:
                     msg = msg[:67] + "..."
                 lines.append(f"  {ts}  {sev:<8} {code:<7} {msg}")
+
+        lines.append("")
+        lines.append(f"SEC-03 — Nuovi comandi sudo visti oggi: {sec03_total_today}")
+
+        if not sec03_new:
+            lines.append("  (nessuna novità oggi)")
+        else:
+            for row in sec03_new:
+                first_ts = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
+                user, runas, cmd = parse_sec03_key(row["key"])
+                count = int(row.get("count", 1))
+                short = cmd.strip()
+                if len(short) > 80:
+                    short = short[:77] + "..."
+                lines.append(f"  {first_ts}  {user}->{runas}  {short}  (x{count})")
 
         lines.append("")
         lines.append("Shortcut:")

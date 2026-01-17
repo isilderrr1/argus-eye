@@ -209,3 +209,24 @@ def first_seen_touch(key: str) -> bool:
         )
         conn.commit()
         return False
+
+
+def list_first_seen(prefix: str, since_ts: int, limit: int = 10):
+    """
+    Lista le chiavi first_seen che iniziano con prefix e con first_ts >= since_ts.
+    Ritorna dict con key, first_ts, last_ts, count.
+    """
+    init_db()
+    like = f"{prefix}%"
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT key, first_ts, last_ts, count
+            FROM first_seen
+            WHERE key LIKE ? AND first_ts >= ?
+            ORDER BY first_ts DESC
+            LIMIT ?
+            """,
+            (like, since_ts, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
