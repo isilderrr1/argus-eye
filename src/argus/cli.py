@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 import typer
+from datetime import datetime
+from argus import db
 
 from argus import __version__, paths, db
 from argus.collectors.authlog import tail_file
@@ -139,3 +141,22 @@ def run(
         run_authlog_security(log_path=log_path)  # <-- Chiama direttamente la funzione ora
     finally:
         set_state("STOPPED")
+
+@app.command("events")
+def events(
+    last: int = typer.Option(20, "--last", "-n", help="Numero di eventi da mostrare (default 20)")
+):
+    """Mostra gli ultimi eventi dal DB (comando di debug/dev)."""
+    rows = db.list_events(limit=last)
+    if not rows:
+        typer.echo("Nessun evento nel DB.")
+        raise typer.Exit()
+
+    for e in rows:
+        ts = datetime.fromtimestamp(int(e["ts"])).strftime("%H:%M:%S")
+        sev = (e.get("severity") or "").upper()
+        code = (e.get("code") or "")
+        msg = (e.get("message") or "").strip()
+        if len(msg) > 140:
+            msg = msg[:137] + "..."
+        typer.echo(f"{ts}  {sev:<8} {code:<6} {msg}")
