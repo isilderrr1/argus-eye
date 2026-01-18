@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argus.trust import add_sec04_trust
 from ipaddress import ip_address
 from datetime import datetime
 from textual.app import App, ComposeResult
@@ -45,12 +46,13 @@ def parse_sec03_key(key: str):
 
 def parse_sec04_key(key: str):
     """
-    key salvata come: sec04|proto|host|port
+    key salvata come: sec04|proc|port|proto|bind
     """
     parts = key.split("|")
-    if len(parts) < 4:
-        return ("?", "?", "?")
-    return (parts[1], parts[2], parts[3])
+    if len(parts) < 5:
+        return ("?", "?", "?", "?")
+    return (parts[1], parts[2], parts[3], parts[4])
+
 
 
 def sec04_exposure(host: str):
@@ -117,20 +119,31 @@ class DashboardPanel(Static):
         sec04_total_today = len(db.list_first_seen(prefix="sec04|", since_ts=since, limit=9999))
 
         lines.append("")
-        lines.append(f"SEC-04 — Nuove porte in ascolto viste oggi: {sec04_total_today}")
+        lines.append(f"SEC-04 — Nuove porte/servizi visti oggi: {sec04_total_today}")
 
         if not sec04_new:
             lines.append("  (nessuna novità oggi)")
         else:
+            sensitive = {22, 23, 3389, 5900, 445, 139, 3306, 5432, 6379, 9200}
             for row in sec04_new:
                 first_ts = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
-                proto, host, port = parse_sec04_key(row["key"])
-                icon, scope, sev = sec04_exposure(host)
-                count = int(row.get("count", 1))
+                proc, port_s, proto, bind = parse_sec04_key(row["key"])
+                try:
+                    port = int(port_s)
+                except Exception:
+                    port = -1
 
-                lines.append(
-                    f"  {first_ts}  {icon} {sev:<8} {proto:<3}  {host}:{port:<5}  ({scope})  (x{count})"
-                )
+                if bind.upper() == "LOCAL":
+                    icon, sev = "🔒", "INFO"
+                elif bind.upper() == "LAN":
+                    icon, sev = "🏠", "WARNING"
+                else:
+                    icon = "🌍"
+                    sev = "CRITICAL" if port in sensitive else "WARNING"
+
+                count = int(row.get("count", 1))
+                lines.append(f"  {first_ts}  👂🌐 {icon} {sev:<8} {proc}  {proto}/{port}  [{bind}]  (x{count})")
+
 
         # SEC-05: modifiche file importanti (oggi) dal DB events
         ev_recent = db.list_events(limit=200)
@@ -206,6 +219,8 @@ class ArgusApp(App):
         ("e", "demo_sec", "Demo SEC"),
         ("h", "demo_hea", "Demo HEA"),
         ("k", "clear_events", "Clear events"),
+        ("t", "trust_last_sec04", "Trust"),
+
     ]
 
     def compose(self) -> ComposeResult:
@@ -243,3 +258,23 @@ class ArgusApp(App):
     def action_clear_events(self) -> None:
         db.clear_events()
         self._refresh()
+
+    def action_trust_last_sec04(self) -> None:
+        # Prendiamo il last first_seen SEC-04 (non serve selezione per v1)
+        rows = db.list_first_seen(prefix="sec04|", since_ts=0, limit=1)
+        if not rows:
+            db.add_event(code="SYS", severity="INFO", message="Trust: nessun SEC-04 da trusted.", entity="tui")
+            self._refresh()
+            return
+
+        key = rows[0]["key"]
+        proc, port_s, proto, bind = parse_sec04_key(key)
+        try:
+            port = int(port_s)
+        except Exception:
+            port = -1
+
+        added, msg = add_sec04_trust(proc, port, bind)
+        db.add_event(code="SYS", severity="INFO", message=f"Trust SEC-04: {msg}", entity="tui")
+        self._refresh()
+

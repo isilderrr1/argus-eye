@@ -13,7 +13,7 @@ from argus.detectors.sec04_listen import ListeningPortDetector
 from argus.detectors.sec05_file_integrity import FileIntegrityDetector
 
 
-def _sec04_loop(stop: threading.Event, interval_s: int = 15) -> None:
+def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = ListeningPortDetector()
 
     # baseline (niente eventi)

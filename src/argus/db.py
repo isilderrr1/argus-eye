@@ -230,3 +230,18 @@ def list_first_seen(prefix: str, since_ts: int, limit: int = 10):
             (like, since_ts, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def prune_first_seen(prefix: str, older_than_ts: int) -> int:
+    """
+    Cancella record first_seen con key che inizia per prefix e first_ts < older_than_ts.
+    Ritorna numero di righe cancellate (best effort).
+    """
+    init_db()
+    like = f"{prefix}%"
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM first_seen WHERE key LIKE ? AND first_ts < ?",
+            (like, older_than_ts),
+        )
+        return cur.rowcount if cur is not None else 0

@@ -1,19 +1,42 @@
 from __future__ import annotations
 
+import re
 import socket
 import subprocess
+import time
 from dataclasses import dataclass
-from ipaddress import ip_address
-from typing import List, Optional, Set, Tuple
+from ipaddress import ip_address, ip_network
+from typing import Dict, List, Optional, Set, Tuple
 
 from argus import db
+from argus.trust import is_sec04_trusted
+
+
+SENSITIVE_PORTS = {22, 23, 3389, 5900, 445, 139, 3306, 5432, 6379, 9200}
+
+LAN_NETS = [
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("100.64.0.0/10"),
+    ip_network("169.254.0.0/16"),
+    ip_network("fc00::/7"),
+    ip_network("fe80::/10"),
+]
+
+RE_PROC = re.compile(r'users:\(\("([^"]+)"')
 
 
 @dataclass(frozen=True)
-class Listener:
-    proto: str   # tcp / udp
-    host: str    # 127.0.0.1, 0.0.0.0, ::, *
+class Key:
+    proc: str
     port: int
+    proto: str   # tcp/udp
+    bind: str    # LOCAL/LAN/GLOBAL
+
+
+def _now() -> int:
+    return int(time.time())
 
 
 def _parse_host_port(local: str) -> Optional[Tuple[str, int]]:
@@ -31,7 +54,7 @@ def _parse_host_port(local: str) -> Optional[Tuple[str, int]]:
             return None
         host, port_s = local.rsplit(":", 1)
 
-    if port_s == "*" or not port_s.isdigit():
+    if not port_s.isdigit():
         return None
     return host, int(port_s)
 
@@ -43,100 +66,177 @@ def _service_name(port: int, proto: str) -> str:
         return "unknown"
 
 
-def _severity_for_host(host: str) -> str:
-    h = host.strip().lower()
+def _bind_type(host: str) -> str:
+    h = (host or "").strip().lower()
 
-    # wildcard / all interfaces
-    if h in ("*", "0.0.0.0", "::"):
-        return "CRITICAL"
-
-    # loopback
     if h in ("127.0.0.1", "::1", "localhost"):
-        return "INFO"
+        return "LOCAL"
+    if h in ("*", "0.0.0.0", "::"):
+        return "GLOBAL"
 
-    # ip reale: private => LAN, public => CRITICAL
     try:
         ip = ip_address(host)
-        if ip.is_private or ip.is_link_local or ip.is_loopback:
-            return "WARNING"
-        return "CRITICAL"
+        if ip.is_loopback:
+            return "LOCAL"
+        for net in LAN_NETS:
+            if ip in net:
+                return "LAN"
+        if getattr(ip, "is_private", False):
+            return "LAN"
+        return "GLOBAL"
     except Exception:
-        # host non parsabile: trattiamolo prudenzialmente
+        return "LAN"
+
+
+def _severity(bind: str, port: int) -> str:
+    if bind == "LOCAL":
+        return "INFO"
+    if bind == "LAN":
         return "WARNING"
+    # GLOBAL:
+    return "CRITICAL" if port in SENSITIVE_PORTS else "WARNING"
 
 
 class ListeningPortDetector:
     """
-    SEC-04: Nuova porta in ascolto.
-    - Fa baseline all'avvio (nessun evento)
-    - Poi emette solo se è first-seen "di sempre" (DB first_seen)
+    SEC-04 — Nuovo servizio/porta in ascolto (spec-perfect)
+    - baseline all'avvio (non emette nulla)
+    - durata minima: presente >= 60s
+    - first-seen 7 giorni (prune)
+    - severità: LOCAL=INFO, LAN=WARNING, GLOBAL=CRIT solo se porta sensibile
+    - trust allowlist: (proc,port,bind) => suppress
     """
 
-    def __init__(self) -> None:
-        self._primed: bool = False
-        self._seen_session: Set[Listener] = set()
+    MIN_DURATION_S = 60
+    RETENTION_S = 7 * 24 * 3600
 
-    def _snapshot(self) -> Set[Listener]:
-        # ss -H -lntu : senza header, listen tcp/udp numerico
-        res = subprocess.run(
-            ["ss", "-H", "-lntu"],
-            capture_output=True,
-            text=True,
-        )
+    def __init__(self) -> None:
+        self._primed = False
+        self._seen_session: Set[Key] = set()
+        self._pending_since: Dict[Key, int] = {}
+        self._last_host: Dict[Key, str] = {}
+        self._last_prune_ts = 0
+
+    def _snapshot(self) -> Dict[Key, str]:
+        """
+        Ritorna mapping Key -> host "migliore" visto ora.
+        Prova ss con processi (-p). Se non disponibile, proc='unknown'.
+        """
+        cmd = ["ss", "-H", "-lntup"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
         out = res.stdout.splitlines() if res.stdout else []
-        snap: Set[Listener] = set()
+
+        snap: Dict[Key, str] = {}
 
         for line in out:
             parts = line.split()
-            # atteso: netid state recvq sendq local peer ...
             if len(parts) < 6:
                 continue
-            proto = parts[0].lower()
-            local = parts[4]
 
+            proto = parts[0].lower()
+            if proto not in ("tcp", "udp"):
+                continue
+
+            local = parts[4]
             hp = _parse_host_port(local)
             if not hp:
                 continue
             host, port = hp
-            if proto not in ("tcp", "udp"):
-                continue
 
-            snap.add(Listener(proto=proto, host=host, port=port))
+            m = RE_PROC.search(line)
+            proc = m.group(1) if m else "unknown"
+
+            bind = _bind_type(host)
+            k = Key(proc=proc, port=port, proto=proto, bind=bind)
+
+            # scegliamo un host preferito (se passa da 127.0.0.1 a 0.0.0.0, preferiamo quello più "ampio")
+            if k not in snap:
+                snap[k] = host
+            else:
+                prev = snap[k].lower()
+                curr = host.lower()
+                # preferisci GLOBAL wildcard se presente
+                if curr in ("0.0.0.0", "::", "*") and prev not in ("0.0.0.0", "::", "*"):
+                    snap[k] = host
 
         return snap
 
-    def poll(self) -> List[Tuple[str, str, str]]:
-        """
-        Ritorna lista di eventi: (severity, entity, message)
-        """
-        snap = self._snapshot()
+    def _prune_if_needed(self) -> None:
+        now = _now()
+        # prune massimo ogni 10 minuti
+        if now - self._last_prune_ts < 600:
+            return
+        cutoff = now - self.RETENTION_S
+        db.prune_first_seen(prefix="sec04|", older_than_ts=cutoff)
+        self._last_prune_ts = now
 
-        # baseline: non emettiamo nulla, solo memorizziamo cosa era già aperto
+    def poll(self) -> List[Tuple[str, str, str]]:
+        self._prune_if_needed()
+
+        snap = self._snapshot()
+        keys_now = set(snap.keys())
+
+        # baseline: memorizza cosa già era in ascolto, niente eventi
         if not self._primed:
-            self._seen_session = set(snap)
+            self._seen_session = set(keys_now)
             self._primed = True
             return []
 
+        now = _now()
         events: List[Tuple[str, str, str]] = []
 
-        for l in snap:
-            if l in self._seen_session:
+        # pending cleanup: se è sparito prima dei 60s, lo rimuoviamo
+        for k in list(self._pending_since.keys()):
+            if k not in keys_now:
+                self._pending_since.pop(k, None)
+                self._last_host.pop(k, None)
+
+        for k in keys_now:
+            # già visto in questa sessione -> niente
+            if k in self._seen_session:
                 continue
 
-            # nuovo nella sessione -> segniamo subito
-            self._seen_session.add(l)
-
-            key = f"sec04|{l.proto}|{l.host}|{l.port}"
-            is_new_ever = db.first_seen_touch(key)
-            if not is_new_ever:
-                # già visto in passato: per home-friendly non emettiamo
+            # avvia timer di stabilità
+            if k not in self._pending_since:
+                self._pending_since[k] = now
+                self._last_host[k] = snap.get(k, "unknown")
                 continue
 
-            sev = _severity_for_host(l.host)
-            svc = _service_name(l.port, l.proto)
-            entity = f"{l.proto}://{l.host}:{l.port}"
-            msg = f"Nuova porta in ascolto: {entity} (service={svc}) [NEW]"
+            # aggiorna host “ultimo visto”
+            self._last_host[k] = snap.get(k, self._last_host.get(k, "unknown"))
 
+            # non è ancora stabile 60s
+            if now - self._pending_since[k] < self.MIN_DURATION_S:
+                continue
+
+            # è stabile: ora lo consideriamo “nuovo” nella sessione
+            self._seen_session.add(k)
+            self._pending_since.pop(k, None)
+
+            host = self._last_host.pop(k, "unknown")
+
+            # TRUST: se allowlisted, non emettiamo (e non scriviamo first_seen)
+            if is_sec04_trusted(k.proc, k.port, k.bind):
+                continue
+
+            # first-seen DB (7 giorni via prune)
+            fs_key = f"sec04|{k.proc}|{k.port}|{k.proto}|{k.bind}"
+            is_new = db.first_seen_touch(fs_key)
+            if not is_new:
+                continue
+
+            sev = _severity(k.bind, k.port)
+            svc = _service_name(k.port, k.proto)
+
+            entity = f"{host}:{k.port}"
+            if sev == "INFO":
+                msg = f"Nuovo servizio locale: {k.proc} su {host}:{k.port}/{k.proto} (service={svc})."
+            elif sev == "WARNING":
+                msg = f"Nuovo servizio in rete: {k.proc} su {host}:{k.port}/{k.proto} (service={svc})."
+            else:
+                msg = f"Porta esposta: {k.proc} su {host}:{k.port}/{k.proto} (service={svc})."
+
+            msg += f" [{k.bind}] [NEW]"
             events.append((sev, entity, msg))
 
         return events
