@@ -132,6 +132,30 @@ class DashboardPanel(Static):
                     f"  {first_ts}  {icon} {sev:<8} {proto:<3}  {host}:{port:<5}  ({scope})  (x{count})"
                 )
 
+        # SEC-05: modifiche file importanti (oggi) dal DB events
+        ev_recent = db.list_events(limit=200)
+        sec05_today = [
+            e for e in ev_recent
+            if e.get("code") == "SEC-05" and int(e.get("ts", 0)) >= since
+        ]
+        sec05_today.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
+
+        lines.append("")
+        lines.append(f"SEC-05 — File importanti modificati oggi: {len(sec05_today)}")
+
+        if not sec05_today:
+            lines.append("  (nessuna modifica rilevata oggi)")
+        else:
+            for e in sec05_today[:5]:
+                ts = datetime.fromtimestamp(int(e["ts"])).strftime("%H:%M:%S")
+                sev = (e.get("severity") or "").upper()
+                icon = "🧬📄"
+                sev_icon = "ℹ️" if sev == "INFO" else ("⚠️" if sev == "WARNING" else "❗")
+                msg = (e.get("message") or "").strip()
+                if len(msg) > 80:
+                    msg = msg[:77] + "..."
+                lines.append(f"  {ts}  {icon}{sev_icon} {msg}")
+
 
         # Eventi
         lines.append("Ultimi eventi (max 10):")
