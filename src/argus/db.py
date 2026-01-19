@@ -11,11 +11,18 @@ def _now() -> int:
     return int(time.time())
 
 
+def get_db_path() -> str:
+    """Path assoluto del DB (utile anche per la TUI)."""
+    return paths.db_file()
+
+
 def connect() -> sqlite3.Connection:
     """Connessione SQLite al DB di Argus."""
     paths.ensure_dirs()
     conn = sqlite3.connect(paths.db_file())
     conn.row_factory = sqlite3.Row
+    # Aiuta a ridurre errori sporadici "database is locked" (thread/poller)
+    conn.execute("PRAGMA busy_timeout=2000;")
     return conn
 
 
@@ -68,7 +75,7 @@ def init_db() -> None:
 # Runtime flags (state/mute/maintenance)
 # -------------------------
 def set_flag(key: str, value: str, ttl_seconds: Optional[int] = None) -> None:
-    """Imposta una flag con scadenza opzionale."""
+    """Imposta una flag con scadenza opzionale (ttl_seconds è una DURATA in secondi)."""
     expires_at = _now() + ttl_seconds if ttl_seconds is not None else None
     with connect() as conn:
         conn.execute(
@@ -178,6 +185,16 @@ def clear_events() -> None:
         conn.commit()
 
 
+def clear_all_events() -> None:
+    """Pulisce events + first_seen (mantiene runtime_flags)."""
+    init_db()
+    with connect() as conn:
+        conn.execute("PRAGMA busy_timeout=2000;")
+        conn.execute("DELETE FROM events;")
+        conn.execute("DELETE FROM first_seen;")
+        conn.commit()
+
+
 # -------------------------
 # First seen (novità / dedupe)
 # -------------------------
@@ -244,4 +261,5 @@ def prune_first_seen(prefix: str, older_than_ts: int) -> int:
             "DELETE FROM first_seen WHERE key LIKE ? AND first_ts < ?",
             (like, older_than_ts),
         )
+        conn.commit()
         return cur.rowcount if cur is not None else 0

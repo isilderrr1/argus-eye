@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import re
-import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from textual.app import App, ComposeResult
@@ -68,15 +66,6 @@ ADVICE: Dict[str, List[str]] = {
         "Ripristina configurazione sicura e ruota credenziali se necessario.",
     ],
 }
-
-
-def _db_path() -> Path:
-    if hasattr(db, "get_db_path"):
-        try:
-            return Path(db.get_db_path())  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    return Path.home() / ".local/share/argus/argus.db"
 
 
 def _midnight_ts() -> int:
@@ -193,7 +182,7 @@ class ArgusApp(App):
     show_details = reactive(True)
 
     _selected: Optional[Selected] = None
-    _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_ts, count)
+    _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
 
     BINDINGS = [
         ("s", "start_monitor", "Start"),
@@ -298,13 +287,9 @@ class ArgusApp(App):
         self._selected = None
         self._last_feed_sig = (-1, -1)
 
-        # DB
+        # DB (events + first_seen)
         try:
-            path = _db_path()
-            with sqlite3.connect(path) as conn:
-                conn.execute("PRAGMA busy_timeout=2000;")
-                conn.execute("DELETE FROM events;")
-                conn.commit()
+            db.clear_all_events()
         except Exception as e:
             db.add_event(code="SYS", severity="WARNING", message=f"Clear events failed: {e!r}", entity="tui")
 
@@ -312,6 +297,9 @@ class ArgusApp(App):
 
     def action_cursor_up(self) -> None:
         lv = self.query_one("#feed", ListView)
+        if not lv.children:
+            lv.index = None
+            return
         if lv.index is None:
             lv.index = 0
         else:
@@ -319,10 +307,13 @@ class ArgusApp(App):
 
     def action_cursor_down(self) -> None:
         lv = self.query_one("#feed", ListView)
+        if not lv.children:
+            lv.index = None
+            return
         if lv.index is None:
             lv.index = 0
         else:
-            lv.index = min(max(0, len(lv.children) - 1), lv.index + 1)
+            lv.index = min(len(lv.children) - 1, lv.index + 1)
 
     def action_open_selected(self) -> None:
         if not self._selected:
@@ -442,8 +433,9 @@ class ArgusApp(App):
 
         all_recent = db.list_events(limit=500)
         visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]  # hide SYS
-        top_ts = int(visible[0]["ts"]) if visible else 0
-        feed_sig = (top_ts, len(visible))
+
+        top_id = int(visible[0]["id"]) if visible else 0
+        feed_sig = (top_id, len(visible))
 
         last_10m = [e for e in visible if int(e.get("ts", 0)) >= since_10m]
         state = _global_state(last_10m)

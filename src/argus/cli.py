@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import re
 import time
-import typer
 from datetime import datetime
-from argus import db
+
+import typer
 
 from argus import __version__, paths, db
 from argus.collectors.authlog import tail_file
-from argus.detectors.sec01_ssh import SshBruteForceDetector
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
-from argus.detectors.sec03_sudo import SudoActivityDetector
 from argus.monitor import run_authlog_security  # <-- import corretto
 
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
+
+_DUR_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.IGNORECASE)
+
+
+def parse_duration(s: str) -> int:
+    """Parsa durate tipo: 30s, 10m, 1h, 2d -> secondi."""
+    m = _DUR_RE.match(s)
+    if not m:
+        raise typer.BadParameter("Durata non valida. Usa: 30s, 10m, 1h, 2d")
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return n * mult
 
 
 def fmt_seconds(sec: int) -> str:
@@ -88,16 +100,16 @@ def stop():
 @app.command()
 def mute(duration: str = typer.Argument("10m", help="Esempio: 10m, 30m, 1h")):
     """Silenzia popup (solo CRITICAL) per un periodo."""
-    seconds = int(time.time()) + parse_duration(duration)
-    db.set_flag("mute", "1", ttl_seconds=seconds)
+    ttl = parse_duration(duration)  # <-- FIX: ttl è DURATA, non timestamp assoluto
+    db.set_flag("mute", "1", ttl_seconds=ttl)
     typer.echo(f"MUTE attivo per {duration}")
 
 
 @app.command()
 def maintenance(duration: str = typer.Argument("30m", help="Esempio: 30m, 1h")):
     """Modalità manutenzione: riduce rumore per un periodo."""
-    seconds = parse_duration(duration)
-    db.set_flag("maintenance", "1", ttl_seconds=seconds)
+    ttl = parse_duration(duration)
+    db.set_flag("maintenance", "1", ttl_seconds=ttl)
     typer.echo(f"MAINTENANCE attivo per {duration}")
 
 
@@ -118,7 +130,7 @@ def sec02(
             result = detector.handle_line(line)
             if result:
                 severity, entity, message = result
-                db.add_event(code="SEC-02", severity=severity, message=message, entity=entity)
+                db.add_event(code="SEC-02", severity=severity, message=message, entity=str(entity))
                 typer.echo(f"[SEC-02] {severity:<8} {entity}  {message}")
 
     except PermissionError:
@@ -138,9 +150,10 @@ def run(
     """Esegui il monitor in foreground (SEC-01) leggendo i log reali."""
     set_state("RUNNING")
     try:
-        run_authlog_security(log_path=log_path)  # <-- Chiama direttamente la funzione ora
+        run_authlog_security(log_path=log_path)
     finally:
         set_state("STOPPED")
+
 
 @app.command("events")
 def events(
