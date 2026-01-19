@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.widgets import Static, ListView, ListItem, Label
 
@@ -18,7 +18,6 @@ from argus import db
 from argus.trust import add_sec04_trust
 
 
-# --- ICONS (spec) ---
 CODE_ICON: Dict[str, str] = {
     "SEC-01": "🚫🔑",
     "SEC-02": "🛡️🔑",
@@ -36,7 +35,6 @@ CODE_ICON: Dict[str, str] = {
 SEV_ICON = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "❗"}
 SEV_STYLE = {"INFO": "cyan", "WARNING": "yellow", "CRITICAL": "red"}
 
-# parse SEC-04 message: "... python3 su 0.0.0.0:3389/tcp ... [GLOBAL] ..."
 RE_SEC04 = re.compile(
     r"^(?:Nuovo servizio locale|Nuovo servizio in rete|Porta esposta):\s*"
     r"(?P<proc>\S+)\s+su\s+(?P<addr>[^:]+):(?P<port>\d+)/(?P<proto>\w+).*\[(?P<bind>LOCAL|LAN|GLOBAL)\]",
@@ -175,12 +173,18 @@ class EventRow(ListItem):
 class ArgusApp(App):
     CSS = """
     Screen { padding: 1 2; }
+
     #hdr { height: 3; }
     #overlay { height: auto; }
     #summary { height: auto; padding: 1 0; }
+
     #main { height: 1fr; }
     #feed { width: 1fr; border: round $surface; }
-    #detail { width: 1fr; border: round $surface; padding: 1 2; }
+
+    /* Dettagli: ora scrollabile */
+    #detail_box { width: 1fr; height: 1fr; border: round $surface; }
+    #detail_text { padding: 1 2; }
+
     #footerbar { height: 1; padding: 0 1; background: $surface; color: $text; }
     .hidden { display: none; }
     """
@@ -212,7 +216,8 @@ class ArgusApp(App):
         yield Static("", id="summary")
         with Horizontal(id="main"):
             yield ListView(id="feed")
-            yield Static("", id="detail")
+            with VerticalScroll(id="detail_box"):
+                yield Static("", id="detail_text")
         yield Static("", id="footerbar")
 
     def on_mount(self) -> None:
@@ -232,18 +237,18 @@ class ArgusApp(App):
 
     def _apply_visibility(self) -> None:
         summary = self.query_one("#summary", Static)
-        detail = self.query_one("#detail", Static)
+        detail_box = self.query_one("#detail_box", VerticalScroll)
 
         if self.view_mode == "minimal":
             summary.add_class("hidden")
-            detail.add_class("hidden")
+            detail_box.add_class("hidden")
             return
 
         summary.remove_class("hidden")
         if self.show_details and self.size.width >= 100:
-            detail.remove_class("hidden")
+            detail_box.remove_class("hidden")
         else:
-            detail.add_class("hidden")
+            detail_box.add_class("hidden")
 
     # ----- actions -----
     def action_start_monitor(self) -> None:
@@ -279,21 +284,21 @@ class ArgusApp(App):
         self._refresh()
 
     def action_clear_events(self) -> None:
-        """K: pulisce davvero gli eventi (DB + UI)."""
+        """K: pulisce eventi (DB + UI)."""
         lv = self.query_one("#feed", ListView)
         overlay = self.query_one("#overlay", Static)
         summary = self.query_one("#summary", Static)
-        detail = self.query_one("#detail", Static)
+        detail_text = self.query_one("#detail_text", Static)
 
-        # 1) UI immediata (così "vedi" che ha funzionato)
+        # UI subito
         lv.clear()
         overlay.update("")
         summary.update("")
-        detail.update("")
+        detail_text.update("")
         self._selected = None
         self._last_feed_sig = (-1, -1)
 
-        # 2) DB (busy_timeout per evitare lock mentre argus run scrive)
+        # DB
         try:
             path = _db_path()
             with sqlite3.connect(path) as conn:
@@ -301,7 +306,6 @@ class ArgusApp(App):
                 conn.execute("DELETE FROM events;")
                 conn.commit()
         except Exception as e:
-            # se fallisce, lo registriamo (ma SYS è nascosto dal feed)
             db.add_event(code="SYS", severity="WARNING", message=f"Clear events failed: {e!r}", entity="tui")
 
         self._refresh()
@@ -367,9 +371,9 @@ class ArgusApp(App):
 
     # ----- detail panel -----
     def _update_detail(self) -> None:
-        detail = self.query_one("#detail", Static)
+        detail_text = self.query_one("#detail_text", Static)
         if not self._selected:
-            detail.update("")
+            detail_text.update("")
             return
 
         e = self._selected.event
@@ -386,7 +390,7 @@ class ArgusApp(App):
         advice = ADVICE.get(code, [])
         advice_txt = "\n".join([f"  • {a}" for a in advice]) if advice else "  • (azioni consigliate: in arrivo)"
 
-        detail.update(
+        detail_text.update(
             "\n".join(
                 [
                     f"[bold]{icon} {code}[/bold]  [{color}]{sev_i} {sev}[/{color}]",
@@ -397,6 +401,8 @@ class ArgusApp(App):
                     f"[bold]Entità[/bold]\n  {ent if ent else '(n/a)'}",
                     "",
                     f"[bold]Cosa fare ora[/bold]\n{advice_txt}",
+                    "",
+                    "[dim]Suggerimento: se il testo è lungo, scorri nel pannello Dettagli.[/dim]",
                 ]
             )
         )
@@ -434,10 +440,8 @@ class ArgusApp(App):
         since_10m = now - 600
         midnight = _midnight_ts()
 
-        # prendo più righe e poi filtro SYS (così il feed resta pieno)
         all_recent = db.list_events(limit=500)
-        visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]
-
+        visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]  # hide SYS
         top_ts = int(visible[0]["ts"]) if visible else 0
         feed_sig = (top_ts, len(visible))
 
@@ -446,14 +450,12 @@ class ArgusApp(App):
         threat = _score(last_10m, "SEC-")
         health = _score(last_10m, "HEA-")
 
-        # placeholder finché non implementiamo HEA-01/03
         temp = "--°C"
         disk = "--%"
 
         run = _status_runstop()
         hdr.update(_fmt_header(state, threat, health, temp, disk, run))
 
-        # Overlay CRITICAL (ultimi 10 minuti)
         crit_now = [e for e in last_10m if (e.get("severity") or "").upper() == "CRITICAL"]
         crit_now = sorted(crit_now, key=lambda x: int(x["ts"]), reverse=True)[:3]
         if crit_now:
@@ -464,7 +466,6 @@ class ArgusApp(App):
         else:
             overlay.update("")
 
-        # Summary dashboard (SEC-03/04 first-seen oggi)
         if self.view_mode == "dashboard":
             counts_today: Dict[str, int] = {}
             for e in visible:
@@ -519,7 +520,6 @@ class ArgusApp(App):
         else:
             summary.update("")
 
-        # Feed update con firma (ts+count): funziona anche quando diventa vuoto
         if feed_sig != self._last_feed_sig:
             self._last_feed_sig = feed_sig
             old_index = lv.index
