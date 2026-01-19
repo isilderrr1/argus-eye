@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal
 from textual.reactive import reactive
-from textual.widgets import Static, Footer, ListView, ListItem, Label
+from textual.widgets import Static, ListView, ListItem, Label
 
 from argus import db
 from argus.trust import add_sec04_trust
@@ -34,12 +36,12 @@ CODE_ICON: Dict[str, str] = {
 SEV_ICON = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "❗"}
 SEV_STYLE = {"INFO": "cyan", "WARNING": "yellow", "CRITICAL": "red"}
 
-# parse SEC-04 message: "Porta esposta: python3 su 0.0.0.0:3389/tcp ... [GLOBAL] ..."
+# parse SEC-04 message: "... python3 su 0.0.0.0:3389/tcp ... [GLOBAL] ..."
 RE_SEC04 = re.compile(
-    r"^(?:Nuovo servizio locale|Nuovo servizio in rete|Porta esposta):\s*(?P<proc>\S+)\s+su\s+(?P<addr>[^:]+):(?P<port>\d+)/(?P<proto>\w+).*\[(?P<bind>LOCAL|LAN|GLOBAL)\]",
+    r"^(?:Nuovo servizio locale|Nuovo servizio in rete|Porta esposta):\s*"
+    r"(?P<proc>\S+)\s+su\s+(?P<addr>[^:]+):(?P<port>\d+)/(?P<proto>\w+).*\[(?P<bind>LOCAL|LAN|GLOBAL)\]",
     re.IGNORECASE,
 )
-
 
 ADVICE: Dict[str, List[str]] = {
     "SEC-01": [
@@ -68,6 +70,15 @@ ADVICE: Dict[str, List[str]] = {
         "Ripristina configurazione sicura e ruota credenziali se necessario.",
     ],
 }
+
+
+def _db_path() -> Path:
+    if hasattr(db, "get_db_path"):
+        try:
+            return Path(db.get_db_path())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return Path.home() / ".local/share/argus/argus.db"
 
 
 def _midnight_ts() -> int:
@@ -162,15 +173,6 @@ class EventRow(ListItem):
 
 
 class ArgusApp(App):
-    """
-    TUI v2:
-    - Feed navigabile (ListView) + ↑/↓ + Enter
-    - Split view dettagli (D)
-    - Start/Stop (S/X)
-    - Trust (T) sul SEC-04 selezionato
-    - Dashboard/Minimal (V): minimal nasconde summary + dettagli
-    """
-
     CSS = """
     Screen { padding: 1 2; }
     #hdr { height: 3; }
@@ -179,14 +181,15 @@ class ArgusApp(App):
     #main { height: 1fr; }
     #feed { width: 1fr; border: round $surface; }
     #detail { width: 1fr; border: round $surface; padding: 1 2; }
+    #footerbar { height: 1; padding: 0 1; background: $surface; color: $text; }
     .hidden { display: none; }
     """
 
-    view_mode = reactive("dashboard")       # dashboard|minimal
+    view_mode = reactive("dashboard")   # dashboard|minimal
     show_details = reactive(True)
 
     _selected: Optional[Selected] = None
-    _last_top_ts: int = 0
+    _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_ts, count)
 
     BINDINGS = [
         ("s", "start_monitor", "Start"),
@@ -194,11 +197,11 @@ class ArgusApp(App):
         ("d", "toggle_details", "Dettagli"),
         ("v", "toggle_view", "Vista"),
         ("t", "trust_selected", "Trust"),
+        ("k", "clear_events", "Pulisci"),
         ("m", "maintenance_30", "Maint 30m"),
         ("u", "mute_10", "Mute 10m"),
         ("enter", "open_selected", "Apri"),
         ("q", "quit", "Quit"),
-        # ↑/↓ li gestisce ListView, ma li lasciamo “sempre”
         ("up", "cursor_up", ""),
         ("down", "cursor_down", ""),
     ]
@@ -207,12 +210,10 @@ class ArgusApp(App):
         yield Static("", id="hdr")
         yield Static("", id="overlay")
         yield Static("", id="summary")
-
         with Horizontal(id="main"):
             yield ListView(id="feed")
             yield Static("", id="detail")
-
-        yield Footer()
+        yield Static("", id="footerbar")
 
     def on_mount(self) -> None:
         db.init_db()
@@ -220,7 +221,7 @@ class ArgusApp(App):
         self._refresh()
         self.query_one("#feed", ListView).focus()
 
-    # ----- Actions -----
+    # ----- view modes -----
     def action_toggle_view(self) -> None:
         self.view_mode = "minimal" if self.view_mode == "dashboard" else "dashboard"
         self._apply_visibility()
@@ -244,6 +245,7 @@ class ArgusApp(App):
         else:
             detail.add_class("hidden")
 
+    # ----- actions -----
     def action_start_monitor(self) -> None:
         try:
             subprocess.run(["argus", "start"], timeout=2)
@@ -276,6 +278,34 @@ class ArgusApp(App):
             db.add_event(code="SYS", severity="WARNING", message=f"Mute: errore ({e!r})", entity="tui")
         self._refresh()
 
+    def action_clear_events(self) -> None:
+        """K: pulisce davvero gli eventi (DB + UI)."""
+        lv = self.query_one("#feed", ListView)
+        overlay = self.query_one("#overlay", Static)
+        summary = self.query_one("#summary", Static)
+        detail = self.query_one("#detail", Static)
+
+        # 1) UI immediata (così "vedi" che ha funzionato)
+        lv.clear()
+        overlay.update("")
+        summary.update("")
+        detail.update("")
+        self._selected = None
+        self._last_feed_sig = (-1, -1)
+
+        # 2) DB (busy_timeout per evitare lock mentre argus run scrive)
+        try:
+            path = _db_path()
+            with sqlite3.connect(path) as conn:
+                conn.execute("PRAGMA busy_timeout=2000;")
+                conn.execute("DELETE FROM events;")
+                conn.commit()
+        except Exception as e:
+            # se fallisce, lo registriamo (ma SYS è nascosto dal feed)
+            db.add_event(code="SYS", severity="WARNING", message=f"Clear events failed: {e!r}", entity="tui")
+
+        self._refresh()
+
     def action_cursor_up(self) -> None:
         lv = self.query_one("#feed", ListView)
         if lv.index is None:
@@ -288,13 +318,15 @@ class ArgusApp(App):
         if lv.index is None:
             lv.index = 0
         else:
-            lv.index = min(len(lv.children) - 1, lv.index + 1)
+            lv.index = min(max(0, len(lv.children) - 1), lv.index + 1)
 
     def action_open_selected(self) -> None:
         if not self._selected:
             return
         e = self._selected.event
-        db.add_event(code="SYS", severity="INFO", message=f"Apri: report non ancora implementato (selezionato {e.get('code')}).", entity="tui")
+        db.add_event(code="SYS", severity="INFO",
+                     message=f"Apri: report non ancora implementato (selezionato {e.get('code')}).",
+                     entity="tui")
         self._refresh()
 
     def action_trust_selected(self) -> None:
@@ -308,13 +340,13 @@ class ArgusApp(App):
         msg = (e.get("message") or "")
 
         if code != "SEC-04":
-            db.add_event(code="SYS", severity="INFO", message="Trust: valido solo su SEC-04 (porta in ascolto).", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Trust: valido solo su SEC-04.", entity="tui")
             self._refresh()
             return
 
         m = RE_SEC04.search(msg)
         if not m:
-            db.add_event(code="SYS", severity="WARNING", message="Trust: non riesco a parsare proc/porta/bind da SEC-04.", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message="Trust: parse proc/porta/bind fallito.", entity="tui")
             self._refresh()
             return
 
@@ -326,14 +358,14 @@ class ArgusApp(App):
         db.add_event(code="SYS", severity="INFO", message=f"Trust SEC-04: {out}", entity="tui")
         self._refresh()
 
-    # ----- Events from ListView -----
+    # ----- listview highlight -----
     def on_list_view_highlighted(self, message: ListView.Highlighted) -> None:
         item = message.item
         if isinstance(item, EventRow):
             self._selected = Selected(event=item.event)
             self._update_detail()
 
-    # ----- Rendering -----
+    # ----- detail panel -----
     def _update_detail(self) -> None:
         detail = self.query_one("#detail", Static)
         if not self._selected:
@@ -369,6 +401,27 @@ class ArgusApp(App):
             )
         )
 
+    # ----- footer -----
+    def _update_footerbar(self) -> None:
+        footer = self.query_one("#footerbar", Static)
+        view = "Dash" if self.view_mode == "dashboard" else "Min"
+        det = "Det ON" if (self.view_mode == "dashboard" and self.show_details and self.size.width >= 100) else "Det OFF"
+        run = _status_runstop()
+
+        flags = []
+        if _flag_badge("mute"):
+            flags.append("MUTE")
+        if _flag_badge("maintenance"):
+            flags.append("MAINT")
+        flags_txt = (" | " + "/".join(flags)) if flags else ""
+
+        footer.update(
+            f"[bold]S[/bold] Start  [bold]X[/bold] Stop  [bold]D[/bold] Dettagli  [bold]V[/bold] Vista  "
+            f"[bold]T[/bold] Trust  [bold]K[/bold] Pulisci  [bold]M[/bold] Maint  [bold]U[/bold] Mute  [bold]Q[/bold] Quit"
+            f"    [dim]{run} | {view} | {det}{flags_txt}[/dim]"
+        )
+
+    # ----- refresh loop -----
     def _refresh(self) -> None:
         db.init_db()
 
@@ -381,10 +434,14 @@ class ArgusApp(App):
         since_10m = now - 600
         midnight = _midnight_ts()
 
-        all_recent = [e for e in db.list_events(limit=400) if (e.get("code") or "") != "SYS"]
-        top_ts = int(all_recent[0]["ts"]) if all_recent else 0
+        # prendo più righe e poi filtro SYS (così il feed resta pieno)
+        all_recent = db.list_events(limit=500)
+        visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]
 
-        last_10m = [e for e in all_recent if int(e.get("ts", 0)) >= since_10m]
+        top_ts = int(visible[0]["ts"]) if visible else 0
+        feed_sig = (top_ts, len(visible))
+
+        last_10m = [e for e in visible if int(e.get("ts", 0)) >= since_10m]
         state = _global_state(last_10m)
         threat = _score(last_10m, "SEC-")
         health = _score(last_10m, "HEA-")
@@ -410,7 +467,7 @@ class ArgusApp(App):
         # Summary dashboard (SEC-03/04 first-seen oggi)
         if self.view_mode == "dashboard":
             counts_today: Dict[str, int] = {}
-            for e in all_recent:
+            for e in visible:
                 if int(e.get("ts", 0)) < midnight:
                     continue
                 c = (e.get("code") or "")
@@ -462,20 +519,24 @@ class ArgusApp(App):
         else:
             summary.update("")
 
-        # Update ListView only if changed (prevents selection reset)
-        if top_ts != self._last_top_ts:
-            self._last_top_ts = top_ts
+        # Feed update con firma (ts+count): funziona anche quando diventa vuoto
+        if feed_sig != self._last_feed_sig:
+            self._last_feed_sig = feed_sig
             old_index = lv.index
 
             lv.clear()
-            for e in all_recent[:20]:  # feed più lungo, ma scorrevole
+            for e in visible[:20]:
                 lv.append(EventRow(e))
 
-            # restore selection
-            if old_index is not None and len(lv.children) > 0:
-                lv.index = min(old_index, len(lv.children) - 1)
-            elif len(lv.children) > 0:
-                lv.index = 0
+            if len(lv.children) > 0:
+                if old_index is not None:
+                    lv.index = min(max(0, old_index), len(lv.children) - 1)
+                else:
+                    lv.index = 0
+            else:
+                lv.index = None
+                self._selected = None
 
         self._apply_visibility()
         self._update_detail()
+        self._update_footerbar()
