@@ -381,7 +381,7 @@ class ArgusApp(App):
         since_10m = now - 600
         midnight = _midnight_ts()
 
-        all_recent = db.list_events(limit=200)  # newest first
+        all_recent = [e for e in db.list_events(limit=400) if (e.get("code") or "") != "SYS"]
         top_ts = int(all_recent[0]["ts"]) if all_recent else 0
 
         last_10m = [e for e in all_recent if int(e.get("ts", 0)) >= since_10m]
