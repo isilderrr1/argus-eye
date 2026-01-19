@@ -11,11 +11,18 @@ def _now() -> int:
     return int(time.time())
 
 
+def get_db_path() -> str:
+    """Path assoluto del DB (utile anche per la TUI)."""
+    return paths.db_file()
+
+
 def connect() -> sqlite3.Connection:
     """Connessione SQLite al DB di Argus."""
     paths.ensure_dirs()
     conn = sqlite3.connect(paths.db_file())
     conn.row_factory = sqlite3.Row
+    # Aiuta a ridurre errori sporadici "database is locked" (thread/poller)
+    conn.execute("PRAGMA busy_timeout=2000;")
     return conn
 
 
@@ -68,7 +75,7 @@ def init_db() -> None:
 # Runtime flags (state/mute/maintenance)
 # -------------------------
 def set_flag(key: str, value: str, ttl_seconds: Optional[int] = None) -> None:
-    """Imposta una flag con scadenza opzionale."""
+    """Imposta una flag con scadenza opzionale (ttl_seconds è una DURATA in secondi)."""
     expires_at = _now() + ttl_seconds if ttl_seconds is not None else None
     with connect() as conn:
         conn.execute(
@@ -176,3 +183,83 @@ def clear_events() -> None:
     with connect() as conn:
         conn.execute("DELETE FROM events")
         conn.commit()
+
+
+def clear_all_events() -> None:
+    """Pulisce events + first_seen (mantiene runtime_flags)."""
+    init_db()
+    with connect() as conn:
+        conn.execute("PRAGMA busy_timeout=2000;")
+        conn.execute("DELETE FROM events;")
+        conn.execute("DELETE FROM first_seen;")
+        conn.commit()
+
+
+# -------------------------
+# First seen (novità / dedupe)
+# -------------------------
+def first_seen_touch(key: str) -> bool:
+    """
+    Registra la chiave in first_seen.
+    Ritorna True se è la prima volta che la vediamo (NEW),
+    False se era già presente (già visto).
+    """
+    init_db()
+    now = _now()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT key FROM first_seen WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                "INSERT INTO first_seen(key, first_ts, last_ts, count) VALUES (?, ?, ?, 1)",
+                (key, now, now),
+            )
+            conn.commit()
+            return True
+
+        conn.execute(
+            "UPDATE first_seen SET last_ts = ?, count = count + 1 WHERE key = ?",
+            (now, key),
+        )
+        conn.commit()
+        return False
+
+
+def list_first_seen(prefix: str, since_ts: int, limit: int = 10):
+    """
+    Lista le chiavi first_seen che iniziano con prefix e con first_ts >= since_ts.
+    Ritorna dict con key, first_ts, last_ts, count.
+    """
+    init_db()
+    like = f"{prefix}%"
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT key, first_ts, last_ts, count
+            FROM first_seen
+            WHERE key LIKE ? AND first_ts >= ?
+            ORDER BY first_ts DESC
+            LIMIT ?
+            """,
+            (like, since_ts, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def prune_first_seen(prefix: str, older_than_ts: int) -> int:
+    """
+    Cancella record first_seen con key che inizia per prefix e first_ts < older_than_ts.
+    Ritorna numero di righe cancellate (best effort).
+    """
+    init_db()
+    like = f"{prefix}%"
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM first_seen WHERE key LIKE ? AND first_ts < ?",
+            (like, older_than_ts),
+        )
+        conn.commit()
+        return cur.rowcount if cur is not None else 0

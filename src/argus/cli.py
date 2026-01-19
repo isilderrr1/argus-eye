@@ -1,24 +1,31 @@
 from __future__ import annotations
 
-import typer
+import re
+import time
 from datetime import datetime
 
+import typer
+
 from argus import __version__, paths, db
+from argus.collectors.authlog import tail_file
+from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
+from argus.monitor import run_authlog_security  # <-- import corretto
+
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
+_DUR_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.IGNORECASE)
+
 
 def parse_duration(s: str) -> int:
-    """
-    Accetta: 10m, 30m, 1h, 2h
-    Ritorna secondi.
-    """
-    s = s.strip().lower()
-    if s.endswith("m") and s[:-1].isdigit():
-        return int(s[:-1]) * 60
-    if s.endswith("h") and s[:-1].isdigit():
-        return int(s[:-1]) * 3600
-    raise typer.BadParameter("Durata non valida. Usa formato tipo 10m o 1h.")
+    """Parsa durate tipo: 30s, 10m, 1h, 2d -> secondi."""
+    m = _DUR_RE.match(s)
+    if not m:
+        raise typer.BadParameter("Durata non valida. Usa: 30s, 10m, 1h, 2d")
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return n * mult
 
 
 def fmt_seconds(sec: int) -> str:
@@ -93,61 +100,76 @@ def stop():
 @app.command()
 def mute(duration: str = typer.Argument("10m", help="Esempio: 10m, 30m, 1h")):
     """Silenzia popup (solo CRITICAL) per un periodo."""
-    seconds = parse_duration(duration)
-    db.set_flag("mute", "1", ttl_seconds=seconds)
+    ttl = parse_duration(duration)  # <-- FIX: ttl è DURATA, non timestamp assoluto
+    db.set_flag("mute", "1", ttl_seconds=ttl)
     typer.echo(f"MUTE attivo per {duration}")
 
 
 @app.command()
 def maintenance(duration: str = typer.Argument("30m", help="Esempio: 30m, 1h")):
     """Modalità manutenzione: riduce rumore per un periodo."""
-    seconds = parse_duration(duration)
-    db.set_flag("maintenance", "1", ttl_seconds=seconds)
+    ttl = parse_duration(duration)
+    db.set_flag("maintenance", "1", ttl_seconds=ttl)
     typer.echo(f"MAINTENANCE attivo per {duration}")
 
 
 @app.command()
-def events(last: int = typer.Option(10, "--last", "-n", help="Quanti eventi mostrare")):
-    """Mostra gli ultimi eventi (feed) dal DB."""
+def sec02(
+    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
+):
+    """Esegui il detector SEC-02 (Success After Fails)"""
+    set_state("RUNNING")
+    detector = SshSuccessAfterFailsDetector()
+
+    try:
+        typer.echo(f"[argus] SEC-02 monitor (auth.log) -> {log_path}")
+        typer.echo("[argus] Premi CTRL+C per fermare.")
+        time.sleep(0.2)
+
+        for line in tail_file(log_path, from_end=True):
+            result = detector.handle_line(line)
+            if result:
+                severity, entity, message = result
+                db.add_event(code="SEC-02", severity=severity, message=message, entity=str(entity))
+                typer.echo(f"[SEC-02] {severity:<8} {entity}  {message}")
+
+    except PermissionError:
+        typer.echo(f"[argus] Permesso negato su {log_path}.")
+        typer.echo("[argus] Soluzione tipica su Ubuntu: aggiungi l'utente al gruppo 'adm':")
+        typer.echo("        sudo usermod -aG adm $USER")
+        typer.echo("        poi fai logout/login (o riavvia).")
+        raise
+    except KeyboardInterrupt:
+        typer.echo("\n[argus] Stop richiesto dall'utente. (CTRL+C)")
+
+
+@app.command()
+def run(
+    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
+):
+    """Esegui il monitor in foreground (SEC-01) leggendo i log reali."""
+    set_state("RUNNING")
+    try:
+        run_authlog_security(log_path=log_path)
+    finally:
+        set_state("STOPPED")
+
+
+@app.command("events")
+def events(
+    last: int = typer.Option(20, "--last", "-n", help="Numero di eventi da mostrare (default 20)")
+):
+    """Mostra gli ultimi eventi dal DB (comando di debug/dev)."""
     rows = db.list_events(limit=last)
     if not rows:
         typer.echo("Nessun evento nel DB.")
         raise typer.Exit()
 
-    for r in rows:
-        ts = datetime.fromtimestamp(int(r["ts"])).strftime("%H:%M:%S")
-        code = r.get("code", "") or ""
-        sev = r.get("severity", "") or ""
-        msg = (r.get("message", "") or "").strip()
-        if len(msg) > 80:
-            msg = msg[:77] + "..."
-        typer.echo(f"{ts}  {sev:<8} {code:<7} {msg}")
-
-
-@app.command()
-def demo(
-    n: int = typer.Option(5, "--n", help="Quanti eventi generare"),
-    kind: str = typer.Option("mix", "--kind", help="mix | sec | hea"),
-):
-    """Genera eventi finti per popolare il feed (studio/debug)."""
-    kind = kind.lower()
-    severities = ["INFO", "WARNING", "CRITICAL"]
-
-    for i in range(n):
-        sev = severities[i % len(severities)]
-        if kind in ("mix", "sec"):
-            db.add_event(
-                code="SEC-01",
-                severity=sev,
-                message=f"DEMO: SSH pattern simulato ({sev})",
-                entity="192.168.1.50",
-            )
-        if kind in ("mix", "hea"):
-            db.add_event(
-                code="HEA-02",
-                severity=sev,
-                message=f"DEMO: Temperatura simulata ({sev})",
-                entity="cpu0",
-            )
-
-    typer.echo(f"Creati eventi demo: n={n}, kind={kind}")
+    for e in rows:
+        ts = datetime.fromtimestamp(int(e["ts"])).strftime("%H:%M:%S")
+        sev = (e.get("severity") or "").upper()
+        code = (e.get("code") or "")
+        msg = (e.get("message") or "").strip()
+        if len(msg) > 140:
+            msg = msg[:137] + "..."
+        typer.echo(f"{ts}  {sev:<8} {code:<6} {msg}")
