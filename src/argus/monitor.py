@@ -6,6 +6,7 @@ import typer
 
 from argus import db
 from argus.collectors.temperature import read_cpu_temp_c
+from argus.detectors.hea_disk import DiskUsageDetector
 from argus.detectors.hea_temperature import TemperatureDetector
 from argus.collectors.authlog import tail_file
 from argus.detectors.sec01_ssh import SshBruteForceDetector
@@ -62,6 +63,24 @@ def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
 
         stop.wait(interval_s)
 
+def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
+    det = DiskUsageDetector()
+
+    # prime poll (no events)
+    det.poll()
+
+    while not stop.is_set():
+        try:
+            for item in det.poll():
+                # item can be (sev, entity, msg, details_json)
+                sev, entity, msg, details_json = item
+                db.add_event(code="HEA-03", severity=sev, message=msg, entity=str(entity), details_json=details_json)
+                typer.echo(f"[HEA-03] {sev:<8} {entity}  {msg}")
+        except Exception as e:
+            typer.echo(f"[HEA-03] ERROR    disk-scan failed: {e!r}")
+
+        stop.wait(interval_s)
+
 
 def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     """
@@ -92,6 +111,9 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     t5.start()
     tT = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
     tT.start()
+    t6 = threading.Thread(target=_hea03_loop, args=(stop,), daemon=True)
+    t6.start()
+
 
     time.sleep(0.2)
 
@@ -124,4 +146,5 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         t4.join(timeout=2)
         t5.join(timeout=2)
         tT.join(timeout=2)
+        t6.join(timeout=2)
 
