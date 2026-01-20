@@ -11,12 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.widgets import Static, ListView, ListItem, Label
-
-from rich.text import Text
 
 from argus import __version__ as ARGUS_VERSION
 from argus import db
@@ -38,7 +38,6 @@ CODE_ICON: Dict[str, str] = {
 }
 
 SEV_ICON = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "❗"}
-SEV_STYLE = {"INFO": "cyan", "WARNING": "yellow", "CRITICAL": "red"}
 
 RE_SEC04 = re.compile(
     r"^(?:Nuovo servizio locale|Nuovo servizio in rete|Porta esposta):\s*"
@@ -48,29 +47,29 @@ RE_SEC04 = re.compile(
 
 ADVICE: Dict[str, List[str]] = {
     "SEC-01": [
-        "Se non sei tu: cambia password e disabilita SSH se non serve.",
-        "Blocca l’IP (ufw/nftables) e verifica utenti/chiavi SSH.",
-        "Controlla report/log per capire username provati e frequenza.",
+        "If it wasn't you: change password and disable SSH if not needed.",
+        "Block the IP (ufw/nftables) and review users/SSH keys.",
+        "Check logs to see usernames targeted and frequency.",
     ],
     "SEC-02": [
-        "Verifica se l’accesso era tuo (IP, orario, user).",
-        "Se sospetto: cambia password e chiudi le sessioni attive.",
-        "Controlla comandi recenti e attività sudo (SEC-03).",
+        "Confirm if the login was yours (IP, time, user).",
+        "If suspicious: change password and close active sessions.",
+        "Review recent commands and sudo activity (SEC-03).",
     ],
     "SEC-03": [
-        "Se non sei tu: cambia password e verifica account/local users.",
-        "Controlla cosa ha fatto quel comando e cosa è cambiato nel sistema.",
-        "Se high-risk: verifica /etc/passwd, sudoers, cron, systemctl, ecc.",
+        "If it wasn't you: change password and review local users.",
+        "Check what that command changed on the system.",
+        "High-risk: review passwd/sudoers/cron/systemctl changes.",
     ],
     "SEC-04": [
-        "Verifica se il servizio è voluto (programma e porta).",
-        "Se non serve: chiudi porta o disabilita il servizio.",
-        "Se è voluto: premi T per Trust (allowlist) e riduci rumore.",
+        "Confirm the service is expected (process and port).",
+        "If not needed: close the port or disable the service.",
+        "If expected: press T to Trust (allowlist) to reduce noise.",
     ],
     "SEC-05": [
-        "Se non sei tu: verifica subito cosa è cambiato nel file.",
-        "Controlla aggiornamenti/maintenance e attività sudo correlate (SEC-03).",
-        "Ripristina configurazione sicura e ruota credenziali se necessario.",
+        "If it wasn't you: verify what changed immediately.",
+        "Check maintenance/updates and related sudo activity (SEC-03).",
+        "Restore secure config and rotate credentials if needed.",
     ],
 }
 
@@ -123,11 +122,9 @@ def _fmt_event_line(e: dict) -> str:
     sev = (e.get("severity") or "INFO").upper()
     code = (e.get("code") or "")
     msg = (e.get("message") or "").strip()
-
     icon = CODE_ICON.get(code, "•")
     sev_i = SEV_ICON.get(sev, "•")
-
-    msg_short = msg if len(msg) <= 95 else (msg[:92] + "...")
+    msg_short = msg if len(msg) <= 100 else (msg[:97] + "...")
     return f"{ts}  {sev_i} {sev:<8} {icon} {code}  {msg_short}"
 
 
@@ -184,7 +181,6 @@ def _get_lan_ip() -> str:
         out = (r.stdout or "").strip().splitlines()
         ips: List[str] = []
         for line in out:
-            # ... inet 192.168.1.10/24 ...
             parts = line.split()
             if "inet" in parts:
                 i = parts.index("inet")
@@ -192,18 +188,13 @@ def _get_lan_ip() -> str:
                 ips.append(ip)
 
         def is_lan(ip: str) -> bool:
-            return (
-                ip.startswith("10.")
-                or ip.startswith("192.168.")
-                or ip.startswith("172.")
-            )
+            return ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.")
 
         for ip in ips:
             if is_lan(ip):
                 return ip
         return ips[0] if ips else "--"
     except Exception:
-        # fallback best-effort
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("1.1.1.1", 80))
@@ -214,41 +205,74 @@ def _get_lan_ip() -> str:
             return "--"
 
 
-def _splash_lines() -> List[str]:
-    # Line-by-line reveal (typing) keeps markup safe.
+def _logo_argus_lines() -> List[str]:
+    # 7-high, very readable block letters: ARGUS
+    A = [
+        "   ███   ",
+        "  █   █  ",
+        " █     █ ",
+        " ███████ ",
+        " █     █ ",
+        " █     █ ",
+        " █     █ ",
+    ]
+    R = [
+        " ██████  ",
+        " █     █ ",
+        " █     █ ",
+        " ██████  ",
+        " █   █   ",
+        " █    █  ",
+        " █     █ ",
+    ]
+    G = [
+        "  ██████ ",
+        " █       ",
+        " █       ",
+        " █  ████ ",
+        " █     █ ",
+        " █     █ ",
+        "  █████  ",
+    ]
+    U = [
+        " █     █ ",
+        " █     █ ",
+        " █     █ ",
+        " █     █ ",
+        " █     █ ",
+        " █     █ ",
+        "  █████  ",
+    ]
+    S = [
+        "  ██████ ",
+        " █       ",
+        " █       ",
+        "  █████  ",
+        "       █ ",
+        "       █ ",
+        " ██████  ",
+    ]
+
+    out: List[str] = []
+    for i in range(7):
+        out.append(A[i] + " " + R[i] + " " + G[i] + " " + U[i] + " " + S[i])
+    return out
+
+
+def _splash_body_lines() -> List[str]:
     return [
-        "[bold green]┌──────────────────────────────────────────────────────────────────────┐[/bold green]",
-        "[bold green]│  █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗                          │[/bold green]",
-        "[bold green]│ ██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝                          │[/bold green]",
-        "[bold green]│ ███████║██████╔╝██║  ███╗██║   ██║███████╗                          │[/bold green]",
-        "[bold green]│ ██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║                          │[/bold green]",
-        "[bold green]│ ██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║                          │[/bold green]",
-        "[bold green]│ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝                          │[/bold green]",
-        "[bold green]└──────────────────────────────────────────────────────────────────────┘[/bold green]",
         "",
-        "[bold]Motto[/bold]: [green]Argus watches. You decide.[/green]",
         "",
-        "[bold]What is ARGUS?[/bold]",
-        "A lightweight Linux monitor for home desktops.",
-        "It watches [bold]security[/bold] and [bold]system health[/bold], and keeps noise low:",
-        "  • Desktop popups only for [bold red]CRITICAL[/bold red] events",
-        "  • Everything else stays in the feed + reports",
-        "",
-        "[bold]Security modules (v1)[/bold]",
-        "  • SEC-01 SSH brute force",
-        "  • SEC-02 Success-after-fail",
-        "  • SEC-03 Unusual sudo (first-seen)",
-        "  • SEC-04 New listening ports (Trust allowlist)",
-        "  • SEC-05 File integrity (hash + debounce)",
-        "",
-        "[bold]Reports[/bold]",
-        "  • Saved as Markdown + JSON under: [dim]~/.local/share/argus/reports/[/dim]",
+        "[bold]What it is[/bold]",
+        "ARGUS is a Linux desktop monitor for security + system health.",
+        "It keeps the UI clean and sends desktop popups only for CRITICAL events.",
         "",
         "[bold]Controls[/bold]",
-        "  [bold]Enter[/bold]  continue to Dashboard",
-        "  [bold]S[/bold] Start   [bold]X[/bold] Stop   [bold]M[/bold] Maintenance 30m   [bold]U[/bold] Mute 10m   [bold]Q[/bold] Quit",
+        "  Enter  -> Continue to Dashboard",
+        "  Q      -> Quit",
         "",
-        "[dim]Tip: if auth.log permission is denied on Ubuntu, add yourself to group 'adm' then relogin.[/dim]",
+        "[bold]Reports[/bold]",
+        "  ~/.local/share/argus/reports/",
     ]
 
 
@@ -269,10 +293,9 @@ class ArgusApp(App):
 
     /* Splash */
     #splash { height: 1fr; border: round $surface; }
-    #splash_banner { height: 3; padding: 0 2; }
-    #splash_matrix { height: 10; padding: 0 2; }
-    #splash_body_scroll { height: 1fr; }
-    #splash_body { padding: 1 2; }
+    #splash_banner { height: 2; padding: 0 2; }
+    #splash_matrix { height: 12; padding: 0 2; }
+    #splash_body { height: 1fr; padding: 0 2; }
 
     /* Main app */
     #app { height: 1fr; }
@@ -298,15 +321,19 @@ class ArgusApp(App):
     _selected: Optional[Selected] = None
     _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
 
-    # Report override
+    # report override
     _detail_override_text: Optional[str] = None
     _detail_override_event_id: Optional[int] = None
 
-    # Splash effects
-    _splash_lines_full: List[str] = []
-    _splash_reveal: int = 0
-    _splash_cursor_on: bool = True
-    _matrix_chars = "01abcdef+-*/<>[]{}()$#@"
+    # matrix/logo state
+    _matrix_w: int = 0
+    _matrix_h: int = 0
+    _matrix_cols: List[List[str]]
+    _matrix_energy: List[int]
+    _matrix_chars: str = "01abcdef+-*/<>$#@"
+    _logo_targets: Dict[Tuple[int, int], str]
+    _logo_locked: set[Tuple[int, int]]
+    _logo_done: bool = False
 
     BINDINGS = [
         ("s", "start_monitor", "Start"),
@@ -317,8 +344,6 @@ class ArgusApp(App):
         ("k", "clear_events", "Pulisci"),
         ("m", "maintenance_30", "Maint 30m"),
         ("u", "mute_10", "Mute 10m"),
-        ("enter", "open_selected", "Continue/Open"),
-        ("escape", "close_report", "Back"),
         ("q", "quit", "Quit"),
         ("up", "cursor_up", ""),
         ("down", "cursor_down", ""),
@@ -328,8 +353,7 @@ class ArgusApp(App):
         with Container(id="splash"):
             yield Static("", id="splash_banner")
             yield Static("", id="splash_matrix")
-            with VerticalScroll(id="splash_body_scroll"):
-                yield Static("", id="splash_body")
+            yield Static("", id="splash_body")
 
         with Container(id="app"):
             yield Static("", id="hdr")
@@ -344,17 +368,35 @@ class ArgusApp(App):
     def on_mount(self) -> None:
         db.init_db()
 
-        self._splash_lines_full = _splash_lines()
-        self._splash_reveal = 0
-        self._splash_cursor_on = True
-
-        # Main refresh
-        self.set_interval(1.0, self._refresh)
-        # Splash animation tick (matrix + typing)
-        self.set_interval(0.12, self._tick_splash)
+        self._logo_targets = {}
+        self._logo_locked = set()
+        self._logo_done = False
 
         self._apply_global_visibility()
-        self._render_splash(initial=True)
+        self._render_splash()
+
+        self.set_interval(0.06, self._tick_splash)  # matrix animation
+        self.set_interval(1.0, self._refresh)       # main refresh
+
+    # -------- Key handling (robust Enter/Esc) --------
+    def on_key(self, event: events.Key) -> None:
+        k = (event.key or "").lower()
+
+        if k in ("enter", "return"):
+            if self.ui_mode == "splash":
+                self.action_continue()
+                event.stop()
+                return
+            # main: Enter opens report (even if ListView consumes Enter)
+            self.action_open_selected()
+            event.stop()
+            return
+
+        if k == "escape":
+            # close report view if open
+            self.action_close_report()
+            event.stop()
+            return
 
     # ---------------- Splash ----------------
     def action_continue(self) -> None:
@@ -381,75 +423,229 @@ class ArgusApp(App):
         kernel = platform.release()
         up = _fmt_uptime(_read_uptime_seconds())
         ip = _get_lan_ip()
-        return (
-            f"[bold green]root@{host}[/bold green]  "
-            f"[dim]|[/dim] v{ARGUS_VERSION}  "
-            f"[dim]|[/dim] kernel {kernel}  "
-            f"[dim]|[/dim] uptime {up}  "
-            f"[dim]|[/dim] ip {ip}"
-        )
 
-    def _matrix_frame(self, width: int, height: int) -> str:
-        w = max(20, min(width - 4, 92))
-        h = max(6, min(height, 14))
-        lines: List[str] = []
-        for _ in range(h):
-            row = []
-            for _c in range(w):
-                # 72% spazio/nero, 28% char "matrix"
-                if random.random() < 0.28:
-                    row.append(random.choice(self._matrix_chars))
-                else:
-                    row.append(" ")
-            lines.append("".join(row))
-        return "\n".join(lines)
+        line0 = "[bold green]ARGUS[/bold green]  [dim]— Argus watches. You decide.[/dim]"
+        line1 = "[bold cyan]OPERATOR[/bold cyan]  [bold]Antonio Ruocco[/bold]"
+        line2 = f"[dim]root@{host} | v{ARGUS_VERSION} | kernel {kernel} | uptime {up} | ip {ip}[/dim]"
 
-    def _render_splash(self, initial: bool = False) -> None:
+        return "\n".join((line0, line1, line2))
+
+    def _ensure_matrix(self) -> None:
+        w = max(48, min(self.size.width - 6, 120))
+        h = 12  # not too compact + space for description
+        if self._matrix_w == w and self._matrix_h == h and hasattr(self, "_matrix_cols"):
+            return
+
+        self._matrix_w = w
+        self._matrix_h = h
+        self._matrix_cols = [[" "] * h for _ in range(w)]
+        self._matrix_energy = [0] * w
+
+        # build logo target positions centered
+        self._logo_targets = {}
+        self._logo_locked = set()
+        self._logo_done = False
+
+        logo = _logo_argus_lines()
+        lh = len(logo)
+        lw = len(logo[0]) if logo else 0
+
+        x0 = max(0, (w - lw) // 2)
+        y0 = max(0, (h - lh) // 2)
+
+        for y in range(lh):
+            row = logo[y]
+            for x in range(lw):
+                ch = row[x]
+                if ch != " ":
+                    self._logo_targets[(x0 + x, y0 + y)] = ch
+
+    def _matrix_step(self) -> None:
+        self._ensure_matrix()
+        if self._logo_done:
+            return
+
+        w, h = self._matrix_w, self._matrix_h
+
+        for x in range(w):
+            col = self._matrix_cols[x]
+            energy = self._matrix_energy[x]
+
+            # start a falling streak sometimes
+            if energy <= 0 and random.random() < 0.12:
+                energy = random.randint(5, 14)
+
+            ch = random.choice(self._matrix_chars) if energy > 0 else " "
+            if energy > 0:
+                energy -= 1
+
+            # shift down
+            col.pop()
+            col.insert(0, ch)
+            self._matrix_energy[x] = energy
+
+        # lock letters when a falling char reaches a target cell
+        for (tx, ty), target_ch in self._logo_targets.items():
+            if (tx, ty) in self._logo_locked:
+                self._matrix_cols[tx][ty] = target_ch
+                continue
+
+            current = self._matrix_cols[tx][ty]
+            if current != " ":
+                # a falling char arrived here -> "settle" into the logo
+                self._logo_locked.add((tx, ty))
+                self._matrix_cols[tx][ty] = target_ch
+
+        if len(self._logo_locked) >= len(self._logo_targets) and self._logo_targets:
+            # stop animation once the logo is fully built
+            self._logo_done = True
+
+    def _matrix_render_text(self) -> Text:
+        self._ensure_matrix()
+        w, h = self._matrix_w, self._matrix_h
+
+        rows: List[str] = []
+        for y in range(h):
+            rows.append("".join(self._matrix_cols[x][y] for x in range(w)))
+        s = "\n".join(rows)
+
+        t = Text(s, style="green")
+        # make logo a bit brighter (bold) by styling target cells
+        # (best-effort; if terminal doesn't support, still ok)
+        if self._logo_targets:
+            for (x, y) in self._logo_targets.keys():
+                idx = y * (w + 1) + x  # +1 for newline
+                if 0 <= idx < len(t):
+                    t.stylize("bold green", idx, idx + 1)
+        return t
+
+    def _render_splash(self) -> None:
         banner = self.query_one("#splash_banner", Static)
         matrix = self.query_one("#splash_matrix", Static)
         body = self.query_one("#splash_body", Static)
 
         banner.update(self._splash_banner_text())
+        matrix.update(self._dm_render())
 
-        # Matrix
-        matrix.update(Text(self._matrix_frame(self.size.width, 10), style="green"))
-
-        # Typing (line reveal)
-        reveal = self._splash_reveal
-        reveal = max(0, min(reveal, len(self._splash_lines_full)))
-        shown = self._splash_lines_full[:reveal]
-
-        cursor = "▮" if self._splash_cursor_on else " "
-        if reveal < len(self._splash_lines_full):
-            # aggiungi cursor alla fine dell'ultima riga visibile
-            if shown:
-                shown = shown[:-1] + [shown[-1] + f" [green]{cursor}[/green]"]
-            else:
-                shown = [f"[green]{cursor}[/green]"]
-        else:
-            # finito: mostra hint fisso
-            shown.append("")
-            shown.append("[bold green]>> Press Enter to continue <<[/bold green]")
-
-        body.update("\n".join(shown) if shown else "")
-
-        if initial:
-            # primo render: fai vedere qualcosa subito
-            self._splash_reveal = min(8, len(self._splash_lines_full))
+        lines = _splash_body_lines()
+        if self._logo_done:
+            lines = lines + ["", "[READY] ARGUS logo locked. Press Enter."]
+        body.update("\n".join(lines))
 
     def _tick_splash(self) -> None:
         if self.ui_mode != "splash":
             return
-
-        # blink cursor
-        self._splash_cursor_on = not self._splash_cursor_on
-
-        # typing speed: 1 linea ogni ~2 tick (0.24s) fino a completamento
-        if self._splash_reveal < len(self._splash_lines_full):
-            if random.random() < 0.55:
-                self._splash_reveal += 1
-
+        self._matrix_step()
+        self._dm_step()
         self._render_splash()
+
+
+    # ---------------- Digit-cascade Splash (ARGUS made of numbers) ----------------
+    def _dm_ensure(self) -> None:
+        import random
+
+        # matrix area (keep compact: one screen)
+        w = max(56, min(self.size.width - 6, 120))
+        h = 12
+
+        if getattr(self, "_dm_w", None) == w and getattr(self, "_dm_h", None) == h:
+            return
+
+        self._dm_w = w
+        self._dm_h = h
+        self._dm_done = False
+
+        # targets from logo mask (non-space pixels)
+        logo = _logo_argus_lines()
+        lh = len(logo)
+        lw = len(logo[0]) if logo else 0
+
+        x0 = max(0, (w - lw) // 2)
+        y0 = max(0, (h - lh) // 2)
+
+        targets = []
+        targets_by_col = {}
+        for y in range(lh):
+            for x in range(lw):
+                if logo[y][x] != " ":
+                    tx, ty = x0 + x, y0 + y
+                    targets.append((tx, ty))
+                    targets_by_col.setdefault(tx, []).append(ty)
+
+        for x in targets_by_col:
+            targets_by_col[x] = sorted(targets_by_col[x])  # top->bottom
+
+        self._dm_targets = set(targets)
+        self._dm_targets_by_col = targets_by_col
+
+        # filled digits on targets + falling per column
+        self._dm_filled = {}   # (x,y) -> digit
+        self._dm_falling = {}  # x -> (y, digit, target_y)
+        self._dm_digits = "0123456789"
+
+    def _dm_step(self) -> None:
+        import random
+
+        self._dm_ensure()
+        if self._dm_done:
+            return
+
+        # spawn per column if needed
+        for x, ys in self._dm_targets_by_col.items():
+            if x in self._dm_falling:
+                continue
+
+            next_ty = None
+            for ty in ys:
+                if (x, ty) not in self._dm_filled:
+                    next_ty = ty
+                    break
+            if next_ty is None:
+                continue
+
+            d = random.choice(self._dm_digits)
+            self._dm_falling[x] = (-1, d, next_ty)  # start above top
+
+        # advance + lock
+        new_falling = {}
+        for x, (y, d, ty) in self._dm_falling.items():
+            y2 = y + 1
+            if y2 >= ty:
+                self._dm_filled[(x, ty)] = d
+            else:
+                new_falling[x] = (y2, d, ty)
+        self._dm_falling = new_falling
+
+        if self._dm_targets and len(self._dm_filled) >= len(self._dm_targets):
+            self._dm_done = True
+
+    def _dm_render(self):
+        from rich.text import Text
+
+        self._dm_ensure()
+        w, h = self._dm_w, self._dm_h
+
+        grid = [[" " for _ in range(w)] for _ in range(h)]
+
+        # locked digits (logo)
+        for (x, y), d in self._dm_filled.items():
+            if 0 <= x < w and 0 <= y < h:
+                grid[y][x] = d
+
+        # falling digits
+        for x, (y, d, _ty) in self._dm_falling.items():
+            if 0 <= x < w and 0 <= y < h and grid[y][x] == " ":
+                grid[y][x] = d
+
+        txt = Text("\n".join("".join(r) for r in grid), style="green")
+
+        # bold target cells (so ARGUS pops)
+        for (x, y) in self._dm_targets:
+            idx = y * (w + 1) + x
+            if 0 <= idx < len(txt):
+                txt.stylize("bold green", idx, idx + 1)
+
+        return txt
 
     # ---------------- Main UI ----------------
     def action_toggle_view(self) -> None:
@@ -489,33 +685,33 @@ class ArgusApp(App):
     def action_start_monitor(self) -> None:
         try:
             subprocess.run(["argus", "start"], timeout=2)
-            db.add_event(code="SYS", severity="INFO", message="Start richiesto dalla TUI.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Start requested from TUI.", entity="tui")
         except Exception as e:
-            db.add_event(code="SYS", severity="WARNING", message=f"Start: errore ({e!r})", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message=f"Start error ({e!r})", entity="tui")
         self._refresh()
 
     def action_stop_monitor(self) -> None:
         try:
             subprocess.run(["argus", "stop"], timeout=2)
-            db.add_event(code="SYS", severity="INFO", message="Stop richiesto dalla TUI.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Stop requested from TUI.", entity="tui")
         except Exception as e:
-            db.add_event(code="SYS", severity="WARNING", message=f"Stop: errore ({e!r})", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message=f"Stop error ({e!r})", entity="tui")
         self._refresh()
 
     def action_maintenance_30(self) -> None:
         try:
             subprocess.run(["argus", "maintenance", "30m"], timeout=2)
-            db.add_event(code="SYS", severity="INFO", message="Maintenance 30m attivata dalla TUI.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Maintenance 30m enabled from TUI.", entity="tui")
         except Exception as e:
-            db.add_event(code="SYS", severity="WARNING", message=f"Maintenance: errore ({e!r})", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message=f"Maintenance error ({e!r})", entity="tui")
         self._refresh()
 
     def action_mute_10(self) -> None:
         try:
             subprocess.run(["argus", "mute", "10m"], timeout=2)
-            db.add_event(code="SYS", severity="INFO", message="Mute popup 10m attivato dalla TUI.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Mute 10m enabled from TUI.", entity="tui")
         except Exception as e:
-            db.add_event(code="SYS", severity="WARNING", message=f"Mute: errore ({e!r})", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message=f"Mute error ({e!r})", entity="tui")
         self._refresh()
 
     def action_clear_events(self) -> None:
@@ -538,7 +734,10 @@ class ArgusApp(App):
         self._detail_override_event_id = None
 
         try:
-            db.clear_all_events()
+            if hasattr(db, "clear_all_events"):
+                db.clear_all_events()  # type: ignore[attr-defined]
+            else:
+                db.clear_events()
         except Exception as e:
             db.add_event(code="SYS", severity="WARNING", message=f"Clear events failed: {e!r}", entity="tui")
 
@@ -569,12 +768,9 @@ class ArgusApp(App):
             lv.index = min(len(lv.children) - 1, lv.index + 1)
 
     def action_open_selected(self) -> None:
-        # Splash: Enter = continue
         if self.ui_mode != "main":
-            self.action_continue()
             return
 
-        detail_text = self.query_one("#detail_text", Static)
         if not self._selected:
             return
 
@@ -582,31 +778,31 @@ class ArgusApp(App):
         eid = int(e.get("id") or 0)
         md_path = (e.get("report_md_path") or "").strip()
         if not md_path:
-            db.add_event(code="SYS", severity="INFO", message="Report: nessun report associato a questo evento.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="No report associated to this event.", entity="tui")
             self._refresh()
             return
 
         p = Path(md_path)
         if not p.exists():
-            db.add_event(code="SYS", severity="WARNING", message=f"Report non trovato su disco: {md_path}", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message=f"Report not found: {md_path}", entity="tui")
             self._refresh()
             return
 
         try:
             txt = p.read_text(encoding="utf-8")
         except Exception as ex:
-            txt = f"Errore lettura report: {ex!r}\nPath: {md_path}"
+            txt = f"Report read error: {ex!r}\nPath: {md_path}"
 
         self._detail_override_text = txt
         self._detail_override_event_id = eid
-        detail_text.update(txt)
+        self.query_one("#detail_text", Static).update(txt)
 
     def action_trust_selected(self) -> None:
         if self.ui_mode != "main":
             return
 
         if not self._selected:
-            db.add_event(code="SYS", severity="INFO", message="Trust: seleziona prima un evento.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Trust: select an event first.", entity="tui")
             self._refresh()
             return
 
@@ -615,13 +811,13 @@ class ArgusApp(App):
         msg = (e.get("message") or "")
 
         if code != "SEC-04":
-            db.add_event(code="SYS", severity="INFO", message="Trust: valido solo su SEC-04.", entity="tui")
+            db.add_event(code="SYS", severity="INFO", message="Trust: valid only for SEC-04.", entity="tui")
             self._refresh()
             return
 
         m = RE_SEC04.search(msg)
         if not m:
-            db.add_event(code="SYS", severity="WARNING", message="Trust: parse proc/porta/bind fallito.", entity="tui")
+            db.add_event(code="SYS", severity="WARNING", message="Trust: failed to parse proc/port/bind.", entity="tui")
             self._refresh()
             return
 
@@ -636,7 +832,6 @@ class ArgusApp(App):
     def on_list_view_highlighted(self, message: ListView.Highlighted) -> None:
         if self.ui_mode != "main":
             return
-
         item = message.item
         if isinstance(item, EventRow):
             new_id = int(item.event.get("id") or 0)
@@ -670,8 +865,8 @@ class ArgusApp(App):
         msg = (e.get("message") or "").strip()
 
         advice = ADVICE.get(code, [])
-        advice_txt = "\n".join([f"  • {a}" for a in advice]) if advice else "  • (azioni consigliate: in arrivo)"
-        has_report = "SI" if (e.get("report_md_path") or "").strip() else "NO"
+        advice_txt = "\n".join([f"  • {a}" for a in advice]) if advice else "  • (actions coming soon)"
+        has_report = "YES" if (e.get("report_md_path") or "").strip() else "NO"
 
         detail_text.update(
             "\n".join(
@@ -679,16 +874,16 @@ class ArgusApp(App):
                     f"{code} ({sev})",
                     f"{ts}",
                     "",
-                    "Cosa è successo",
+                    "What happened",
                     f"  {msg}",
                     "",
-                    "Entità",
+                    "Entity",
                     f"  {ent if ent else '(n/a)'}",
                     "",
-                    "Cosa fare ora",
+                    "What to do now",
                     f"{advice_txt}",
                     "",
-                    f"Report associato: {has_report}  (Enter apre, Esc torna indietro)",
+                    f"Report: {has_report}  (Enter opens, Esc goes back)",
                 ]
             )
         )
@@ -710,7 +905,7 @@ class ArgusApp(App):
         flags_txt = (" | " + "/".join(flags)) if flags else ""
 
         footer.update(
-            f"S Start  X Stop  D Dettagli  V Vista  T Trust  K Pulisci  M Maint  U Mute  Enter Report  Esc Back  Q Quit"
+            f"S Start  X Stop  D Details  V View  T Trust  K Clear  M Maint  U Mute  Enter Report  Esc Back  Q Quit"
             f"    {run} | {view} | {det}{flags_txt}"
         )
 
@@ -732,7 +927,7 @@ class ArgusApp(App):
         all_recent = db.list_events(limit=500)
         visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]
 
-        top_id = int(visible[0]["id"]) if visible else 0
+        top_id = int(visible[0].get("id") or 0) if visible else 0
         feed_sig = (top_id, len(visible))
 
         last_10m = [e for e in visible if int(e.get("ts", 0)) >= since_10m]
@@ -769,19 +964,19 @@ class ArgusApp(App):
             sec04_today = db.list_first_seen(prefix="sec04|", since_ts=midnight, limit=5)
 
             out: List[str] = []
-            out.append("Sicurezza (oggi)")
+            out.append("Security (today)")
             any_sec = False
             for c in ["SEC-01", "SEC-02", "SEC-03", "SEC-04", "SEC-05"]:
                 if c in counts_today:
                     any_sec = True
                     out.append(f"  {CODE_ICON.get(c,'•')} {c}  x{counts_today[c]}")
             if not any_sec:
-                out.append("  (nessun evento SEC oggi)")
+                out.append("  (no SEC events today)")
 
             out.append("")
-            out.append("SEC-03 — Sudo insoliti visti oggi (first-seen)")
+            out.append("SEC-03 — Unusual sudo seen today (first-seen)")
             if not sec03_today:
-                out.append("  (nessuna novità oggi)")
+                out.append("  (no new entries today)")
             else:
                 for row in sec03_today:
                     t = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
@@ -791,9 +986,9 @@ class ArgusApp(App):
                     out.append(f"  {t}  🧨  {user}  {cmd_s}  (x{cnt})")
 
             out.append("")
-            out.append("SEC-04 — Nuove porte/servizi visti oggi (first-seen)")
+            out.append("SEC-04 — New listening services seen today (first-seen)")
             if not sec04_today:
-                out.append("  (nessuna novità oggi)")
+                out.append("  (no new entries today)")
             else:
                 for row in sec04_today:
                     t = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
