@@ -520,11 +520,12 @@ class ArgusApp(App):
         return t
 
     def _splash_ready_line(self) -> str:
-        return (
-            "[green][ OK ][/green] detectors armed  ·  "
-            "[green][ OK ][/green] reports enabled  ·  "
-            "[bold green][ READY ][/bold green] press Enter"
-        )
+        # Hacker-green (RGB) + badge con background per staccare anche su temi diversi
+        ok = "[#00ff00][ OK ][/#00ff00]"
+        dot = "[dim]·[/dim]"
+        ready = "[bold black on #00ff00]  READY  [/bold black on #00ff00]"
+        msg = "[#00ff00]press Enter[/#00ff00]"
+        return f"{ok} [#00ff00]detectors armed[/#00ff00]  {dot}  {ok} [#00ff00]reports enabled[/#00ff00]  {dot}  {ready} {msg}"
 
     def _splash_body_render_text(self) -> str:
         txt = "\n".join(_splash_body_lines())
