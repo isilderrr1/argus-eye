@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import platform
+import random
 import re
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
@@ -13,6 +16,9 @@ from textual.containers import Container, Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.widgets import Static, ListView, ListItem, Label
 
+from rich.text import Text
+
+from argus import __version__ as ARGUS_VERSION
 from argus import db
 from argus.trust import add_sec04_trust
 
@@ -147,47 +153,103 @@ def _parse_sec03_key(key: str) -> tuple[str, str]:
     return user, cmd
 
 
-def _splash_text() -> str:
-    # Rich markup (Textual)
-    return "\n".join(
-        [
-            "[bold green]┌──────────────────────────────────────────────────────────────────────┐[/bold green]",
-            "[bold green]│  █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗                          │[/bold green]",
-            "[bold green]│ ██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝                          │[/bold green]",
-            "[bold green]│ ███████║██████╔╝██║  ███╗██║   ██║███████╗                          │[/bold green]",
-            "[bold green]│ ██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║                          │[/bold green]",
-            "[bold green]│ ██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║                          │[/bold green]",
-            "[bold green]│ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝                          │[/bold green]",
-            "[bold green]└──────────────────────────────────────────────────────────────────────┘[/bold green]",
-            "",
-            "[green]        .-''''-.                       [/green]",
-            "[green]     .-'  _  _  '-.                    [/green]",
-            "[green]    /    (o)(o)    \\                   [/green]",
-            "[green]   |      .--.      |   [bold]Argus watches. You decide.[/bold][/green]",
-            "[green]    \\    (____)    /                    [/green]",
-            "[green]     '-.        .-'                     [/green]",
-            "[green]        '-.__.-'                        [/green]",
-            "",
-            "[bold]What is ARGUS?[/bold]",
-            "ARGUS is a lightweight Linux monitor for home desktops.",
-            "It watches [bold]security[/bold] and [bold]system health[/bold] and keeps noise low:",
-            "  • Popups only for [bold red]CRITICAL[/bold red] events",
-            "  • Everything else goes to the feed + reports",
-            "",
-            "[bold]Security modules[/bold] (v1):",
-            "  • SSH brute force (SEC-01) / success-after-fail (SEC-02)",
-            "  • Unusual sudo (SEC-03) / new listening ports (SEC-04) / file integrity (SEC-05)",
-            "",
-            "[bold]Reports[/bold]:",
-            "  • Markdown + JSON are saved under [dim]~/.local/share/argus/reports/[/dim]",
-            "",
-            "[bold]Quick keys[/bold]:",
-            "  [bold]Enter[/bold] Continue to Dashboard",
-            "  [bold]S[/bold] Start   [bold]X[/bold] Stop   [bold]M[/bold] Maintenance 30m   [bold]U[/bold] Mute 10m   [bold]Q[/bold] Quit",
-            "",
-            "[dim]Tip: if you can't read /var/log/auth.log on Ubuntu, add yourself to group 'adm' and relogin.[/dim]",
-        ]
-    )
+def _read_uptime_seconds() -> Optional[int]:
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            first = f.read().strip().split()[0]
+        return int(float(first))
+    except Exception:
+        return None
+
+
+def _fmt_uptime(sec: Optional[int]) -> str:
+    if sec is None:
+        return "--"
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d > 0:
+        return f"{d}d {h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _get_lan_ip() -> str:
+    try:
+        r = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        out = (r.stdout or "").strip().splitlines()
+        ips: List[str] = []
+        for line in out:
+            # ... inet 192.168.1.10/24 ...
+            parts = line.split()
+            if "inet" in parts:
+                i = parts.index("inet")
+                ip = parts[i + 1].split("/")[0]
+                ips.append(ip)
+
+        def is_lan(ip: str) -> bool:
+            return (
+                ip.startswith("10.")
+                or ip.startswith("192.168.")
+                or ip.startswith("172.")
+            )
+
+        for ip in ips:
+            if is_lan(ip):
+                return ip
+        return ips[0] if ips else "--"
+    except Exception:
+        # fallback best-effort
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("1.1.1.1", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "--"
+
+
+def _splash_lines() -> List[str]:
+    # Line-by-line reveal (typing) keeps markup safe.
+    return [
+        "[bold green]┌──────────────────────────────────────────────────────────────────────┐[/bold green]",
+        "[bold green]│  █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗                          │[/bold green]",
+        "[bold green]│ ██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝                          │[/bold green]",
+        "[bold green]│ ███████║██████╔╝██║  ███╗██║   ██║███████╗                          │[/bold green]",
+        "[bold green]│ ██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║                          │[/bold green]",
+        "[bold green]│ ██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║                          │[/bold green]",
+        "[bold green]│ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝                          │[/bold green]",
+        "[bold green]└──────────────────────────────────────────────────────────────────────┘[/bold green]",
+        "",
+        "[bold]Motto[/bold]: [green]Argus watches. You decide.[/green]",
+        "",
+        "[bold]What is ARGUS?[/bold]",
+        "A lightweight Linux monitor for home desktops.",
+        "It watches [bold]security[/bold] and [bold]system health[/bold], and keeps noise low:",
+        "  • Desktop popups only for [bold red]CRITICAL[/bold red] events",
+        "  • Everything else stays in the feed + reports",
+        "",
+        "[bold]Security modules (v1)[/bold]",
+        "  • SEC-01 SSH brute force",
+        "  • SEC-02 Success-after-fail",
+        "  • SEC-03 Unusual sudo (first-seen)",
+        "  • SEC-04 New listening ports (Trust allowlist)",
+        "  • SEC-05 File integrity (hash + debounce)",
+        "",
+        "[bold]Reports[/bold]",
+        "  • Saved as Markdown + JSON under: [dim]~/.local/share/argus/reports/[/dim]",
+        "",
+        "[bold]Controls[/bold]",
+        "  [bold]Enter[/bold]  continue to Dashboard",
+        "  [bold]S[/bold] Start   [bold]X[/bold] Stop   [bold]M[/bold] Maintenance 30m   [bold]U[/bold] Mute 10m   [bold]Q[/bold] Quit",
+        "",
+        "[dim]Tip: if auth.log permission is denied on Ubuntu, add yourself to group 'adm' then relogin.[/dim]",
+    ]
 
 
 @dataclass
@@ -205,9 +267,14 @@ class ArgusApp(App):
     CSS = """
     Screen { padding: 1 2; }
 
+    /* Splash */
     #splash { height: 1fr; border: round $surface; }
-    #splash_text { padding: 1 2; }
+    #splash_banner { height: 3; padding: 0 2; }
+    #splash_matrix { height: 10; padding: 0 2; }
+    #splash_body_scroll { height: 1fr; }
+    #splash_body { padding: 1 2; }
 
+    /* Main app */
     #app { height: 1fr; }
     #hdr { height: 3; }
     #overlay { height: auto; }
@@ -220,6 +287,7 @@ class ArgusApp(App):
     #detail_text { padding: 1 2; }
 
     #footerbar { height: 1; padding: 0 1; background: $surface; color: $text; }
+
     .hidden { display: none; }
     """
 
@@ -230,9 +298,15 @@ class ArgusApp(App):
     _selected: Optional[Selected] = None
     _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
 
-    # Report override: quando apri un report con Enter, lo blocchiamo qui per non farlo sovrascrivere dal refresh.
+    # Report override
     _detail_override_text: Optional[str] = None
     _detail_override_event_id: Optional[int] = None
+
+    # Splash effects
+    _splash_lines_full: List[str] = []
+    _splash_reveal: int = 0
+    _splash_cursor_on: bool = True
+    _matrix_chars = "01abcdef+-*/<>[]{}()$#@"
 
     BINDINGS = [
         ("s", "start_monitor", "Start"),
@@ -251,8 +325,11 @@ class ArgusApp(App):
     ]
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="splash"):
-            yield Static(_splash_text(), id="splash_text")
+        with Container(id="splash"):
+            yield Static("", id="splash_banner")
+            yield Static("", id="splash_matrix")
+            with VerticalScroll(id="splash_body_scroll"):
+                yield Static("", id="splash_body")
 
         with Container(id="app"):
             yield Static("", id="hdr")
@@ -266,11 +343,20 @@ class ArgusApp(App):
 
     def on_mount(self) -> None:
         db.init_db()
-        self.set_interval(1.0, self._refresh)
-        self._apply_global_visibility()
-        self._refresh()
 
-    # ----- splash/global visibility -----
+        self._splash_lines_full = _splash_lines()
+        self._splash_reveal = 0
+        self._splash_cursor_on = True
+
+        # Main refresh
+        self.set_interval(1.0, self._refresh)
+        # Splash animation tick (matrix + typing)
+        self.set_interval(0.12, self._tick_splash)
+
+        self._apply_global_visibility()
+        self._render_splash(initial=True)
+
+    # ---------------- Splash ----------------
     def action_continue(self) -> None:
         self.ui_mode = "main"
         self._apply_global_visibility()
@@ -278,7 +364,7 @@ class ArgusApp(App):
         self.query_one("#feed", ListView).focus()
 
     def _apply_global_visibility(self) -> None:
-        splash = self.query_one("#splash", VerticalScroll)
+        splash = self.query_one("#splash", Container)
         app = self.query_one("#app", Container)
 
         if self.ui_mode == "splash":
@@ -290,7 +376,82 @@ class ArgusApp(App):
         app.remove_class("hidden")
         self._apply_visibility()
 
-    # ----- view modes -----
+    def _splash_banner_text(self) -> str:
+        host = socket.gethostname()
+        kernel = platform.release()
+        up = _fmt_uptime(_read_uptime_seconds())
+        ip = _get_lan_ip()
+        return (
+            f"[bold green]root@{host}[/bold green]  "
+            f"[dim]|[/dim] v{ARGUS_VERSION}  "
+            f"[dim]|[/dim] kernel {kernel}  "
+            f"[dim]|[/dim] uptime {up}  "
+            f"[dim]|[/dim] ip {ip}"
+        )
+
+    def _matrix_frame(self, width: int, height: int) -> str:
+        w = max(20, min(width - 4, 92))
+        h = max(6, min(height, 14))
+        lines: List[str] = []
+        for _ in range(h):
+            row = []
+            for _c in range(w):
+                # 72% spazio/nero, 28% char "matrix"
+                if random.random() < 0.28:
+                    row.append(random.choice(self._matrix_chars))
+                else:
+                    row.append(" ")
+            lines.append("".join(row))
+        return "\n".join(lines)
+
+    def _render_splash(self, initial: bool = False) -> None:
+        banner = self.query_one("#splash_banner", Static)
+        matrix = self.query_one("#splash_matrix", Static)
+        body = self.query_one("#splash_body", Static)
+
+        banner.update(self._splash_banner_text())
+
+        # Matrix
+        matrix.update(Text(self._matrix_frame(self.size.width, 10), style="green"))
+
+        # Typing (line reveal)
+        reveal = self._splash_reveal
+        reveal = max(0, min(reveal, len(self._splash_lines_full)))
+        shown = self._splash_lines_full[:reveal]
+
+        cursor = "▮" if self._splash_cursor_on else " "
+        if reveal < len(self._splash_lines_full):
+            # aggiungi cursor alla fine dell'ultima riga visibile
+            if shown:
+                shown = shown[:-1] + [shown[-1] + f" [green]{cursor}[/green]"]
+            else:
+                shown = [f"[green]{cursor}[/green]"]
+        else:
+            # finito: mostra hint fisso
+            shown.append("")
+            shown.append("[bold green]>> Press Enter to continue <<[/bold green]")
+
+        body.update("\n".join(shown) if shown else "")
+
+        if initial:
+            # primo render: fai vedere qualcosa subito
+            self._splash_reveal = min(8, len(self._splash_lines_full))
+
+    def _tick_splash(self) -> None:
+        if self.ui_mode != "splash":
+            return
+
+        # blink cursor
+        self._splash_cursor_on = not self._splash_cursor_on
+
+        # typing speed: 1 linea ogni ~2 tick (0.24s) fino a completamento
+        if self._splash_reveal < len(self._splash_lines_full):
+            if random.random() < 0.55:
+                self._splash_reveal += 1
+
+        self._render_splash()
+
+    # ---------------- Main UI ----------------
     def action_toggle_view(self) -> None:
         if self.ui_mode != "main":
             return
@@ -318,9 +479,7 @@ class ArgusApp(App):
         else:
             detail_box.add_class("hidden")
 
-    # ----- actions -----
     def action_close_report(self) -> None:
-        """Esc: esce dalla vista report e torna ai dettagli evento."""
         if self._detail_override_text is None:
             return
         self._detail_override_text = None
@@ -410,7 +569,7 @@ class ArgusApp(App):
             lv.index = min(len(lv.children) - 1, lv.index + 1)
 
     def action_open_selected(self) -> None:
-        # In splash: Enter = continue
+        # Splash: Enter = continue
         if self.ui_mode != "main":
             self.action_continue()
             return
@@ -474,7 +633,6 @@ class ArgusApp(App):
         db.add_event(code="SYS", severity="INFO", message=f"Trust SEC-04: {out}", entity="tui")
         self._refresh()
 
-    # ----- listview highlight -----
     def on_list_view_highlighted(self, message: ListView.Highlighted) -> None:
         if self.ui_mode != "main":
             return
@@ -489,7 +647,6 @@ class ArgusApp(App):
             self._selected = Selected(event=item.event)
             self._update_detail()
 
-    # ----- detail panel -----
     def _update_detail(self) -> None:
         if self.ui_mode != "main":
             return
@@ -536,7 +693,6 @@ class ArgusApp(App):
             )
         )
 
-    # ----- footer -----
     def _update_footerbar(self) -> None:
         if self.ui_mode != "main":
             return
@@ -558,11 +714,9 @@ class ArgusApp(App):
             f"    {run} | {view} | {det}{flags_txt}"
         )
 
-    # ----- refresh loop -----
     def _refresh(self) -> None:
         db.init_db()
 
-        # In splash non serve aggiornare UI “main”, ma possiamo lasciare il loop attivo (non rompe).
         if self.ui_mode != "main":
             return
 
