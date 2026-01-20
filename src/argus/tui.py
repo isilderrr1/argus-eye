@@ -307,7 +307,7 @@ class ArgusApp(App):
     #detail_box { width: 1fr; height: 1fr; border: round $surface; }
     #detail_text { padding: 1 2; }
 
-    #footerbar { height: 2; padding: 0 1; background: #001400; color: #00ff66; }
+    #footerbar { height: 2; padding: 0 1; background: $surface; color: $text; }
 
     .hidden { display: none; }
     """
@@ -814,20 +814,27 @@ class ArgusApp(App):
 
         footer = self.query_one("#footerbar", Static)
 
-        # Marker: se NON lo vedi, non stai usando questo footer
-        marker = "[bold #00ff66]FOOTER_V2[/bold #00ff66]"
+        # Palette "pro" (GitHub-ish dark)
+        KEY_BG = "#30363d"
+        KEY_FG = "#e6edf3"
+        OK_BG = "#1f6feb"
+        DANGER_BG = "#8b2f2f"
+        DIM = "[dim]|[/dim]"
 
-        def cap(key: str, bg: str = "#00ff66") -> str:
-            return f"[bold black on {bg}] {key} [/bold black on {bg}]"
-
-        def cap_dim(key: str) -> str:
-            return f"[bold white on #143314] {key} [/bold white on #143314]"
+        def cap(key: str, bg: str = KEY_BG) -> str:
+            return f"[bold {KEY_FG} on {bg}] {key} [/bold {KEY_FG} on {bg}]"
 
         run_line = _status_runstop()  # es: "STATE: RUNNING"
         state = run_line.split(":", 1)[1].strip() if ":" in run_line else run_line.strip()
         state = state or "UNKNOWN"
 
-        state_col = "#00ff66" if "RUN" in state.upper() else ("#ff5555" if "STOP" in state.upper() else "#ffff66")
+        # colori stato (sobri)
+        if "RUN" in state.upper():
+            state_col = "#3fb950"
+        elif "STOP" in state.upper():
+            state_col = "#f85149"
+        else:
+            state_col = "#d29922"
 
         view = "Dashboard" if self.view_mode == "dashboard" else "Minimal"
         det_on = (self.view_mode == "dashboard" and self.show_details and self.size.width >= 100)
@@ -835,34 +842,32 @@ class ArgusApp(App):
 
         flags = []
         if _flag_badge("mute"):
-            flags.append("[yellow]MUTE[/yellow]")
+            flags.append("[#d29922]MUTE[/#d29922]")
         if _flag_badge("maintenance"):
-            flags.append("[cyan]MAINT[/cyan]")
+            flags.append("[#58a6ff]MAINT[/#58a6ff]")
         flags_txt = " ".join(flags) if flags else "[dim]none[/dim]"
 
-        # Riga 1: comandi (spaziati + keycaps)
+        # Riga 1: comandi (puliti + keycaps)
         line1 = (
-            f"{marker}  "
-            f"{cap('S','green')}[dim]Start[/dim]  "
-            f"{cap('X','#ff3333')}[dim]Stop[/dim]  "
-            f"{cap('D','cyan')}[dim]Details[/dim]  "
-            f"{cap('V','#cc66ff')}[dim]View[/dim]  "
-            f"{cap('T','yellow')}[dim]Trust[/dim]  "
-            f"{cap_dim('K')}[dim]Clear[/dim]  "
-            f"{cap('M','#3399ff')}[dim]Maint[/dim]  "
-            f"{cap_dim('U')}[dim]Mute[/dim]  "
-            f"{cap('Enter','green')}[dim]Report[/dim]  "
-            f"{cap_dim('Esc')}[dim]Back[/dim]  "
-            f"{cap('Q','#ff3333')}[dim]Quit[/dim]"
+            f"{cap('S', OK_BG)}[dim] Start[/dim]  "
+            f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
+            f"{cap('D')}[dim] Details[/dim]  "
+            f"{cap('V')}[dim] View[/dim]  "
+            f"{cap('T')}[dim] Trust[/dim]  "
+            f"{cap('K')}[dim] Clear[/dim]  "
+            f"{cap('M')}[dim] Maint[/dim]  "
+            f"{cap('U')}[dim] Mute[/dim]  "
+            f"{cap('Enter', OK_BG)}[dim] Report[/dim]  "
+            f"{cap('Esc')}[dim] Back[/dim]  "
+            f"{cap('Q', DANGER_BG)}[dim] Quit[/dim]"
         )
 
-        # Riga 2: stato pulito
+        # Riga 2: stato (molto leggibile)
         line2 = (
-            f"[dim]—[/dim] "
-            f"[bold]STATE[/bold] [{state_col}]{state}[/{state_col}]  "
-            f"[dim]|[/dim] [bold]VIEW[/bold] {view}  "
-            f"[dim]|[/dim] [bold]DETAILS[/bold] {det}  "
-            f"[dim]|[/dim] [bold]FLAGS[/bold] {flags_txt}"
+            f"[bold]STATE[/bold] [{state_col}]{state}[/{state_col}]  {DIM} "
+            f"[bold]VIEW[/bold] {view}  {DIM} "
+            f"[bold]DETAILS[/bold] {det}  {DIM} "
+            f"[bold]FLAGS[/bold] {flags_txt}"
         )
 
         footer.update(line1 + "\\n" + line2)
