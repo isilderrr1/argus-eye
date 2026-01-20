@@ -5,6 +5,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from textual.app import App, ComposeResult
@@ -119,10 +120,9 @@ def _fmt_event_line(e: dict) -> str:
 
     icon = CODE_ICON.get(code, "•")
     sev_i = SEV_ICON.get(sev, "•")
-    color = SEV_STYLE.get(sev, "white")
 
     msg_short = msg if len(msg) <= 95 else (msg[:92] + "...")
-    return f"{ts}  [{color}]{sev_i} {sev:<8}[/{color}] {icon} [dim]{code}[/dim]  {msg_short}"
+    return f"{ts}  {sev_i} {sev:<8} {icon} {code}  {msg_short}"
 
 
 def _fmt_header(state: str, threat: int, health: int, temp: str, disk: str, run: str) -> str:
@@ -135,8 +135,7 @@ def _fmt_header(state: str, threat: int, health: int, temp: str, disk: str, run:
         mm.append("MAINT")
     mm_txt = (" | " + "/".join(mm)) if mm else ""
     return (
-        f"👁 [bold]ARGUS[/bold] | [bold]{state}[/bold] | "
-        f"Threat [bold]{threat}/100[/bold] | Health [bold]{health}/100[/bold] | "
+        f"👁 ARGUS | {state} | Threat {threat}/100 | Health {health}/100 | "
         f"🌡 {temp} | 💽 {disk} | 🔔 CRIT | {run}{mm_txt}"
     )
 
@@ -170,7 +169,6 @@ class ArgusApp(App):
     #main { height: 1fr; }
     #feed { width: 1fr; border: round $surface; }
 
-    /* Dettagli: ora scrollabile */
     #detail_box { width: 1fr; height: 1fr; border: round $surface; }
     #detail_text { padding: 1 2; }
 
@@ -184,6 +182,10 @@ class ArgusApp(App):
     _selected: Optional[Selected] = None
     _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
 
+    # Quando apri un report con Enter, lo "blocchiamo" qui per non farlo sovrascrivere dal refresh.
+    _detail_override_text: Optional[str] = None
+    _detail_override_event_id: Optional[int] = None
+
     BINDINGS = [
         ("s", "start_monitor", "Start"),
         ("x", "stop_monitor", "Stop"),
@@ -194,6 +196,7 @@ class ArgusApp(App):
         ("m", "maintenance_30", "Maint 30m"),
         ("u", "mute_10", "Mute 10m"),
         ("enter", "open_selected", "Apri"),
+        ("escape", "close_report", "Indietro"),
         ("q", "quit", "Quit"),
         ("up", "cursor_up", ""),
         ("down", "cursor_down", ""),
@@ -215,7 +218,6 @@ class ArgusApp(App):
         self._refresh()
         self.query_one("#feed", ListView).focus()
 
-    # ----- view modes -----
     def action_toggle_view(self) -> None:
         self.view_mode = "minimal" if self.view_mode == "dashboard" else "dashboard"
         self._apply_visibility()
@@ -239,7 +241,14 @@ class ArgusApp(App):
         else:
             detail_box.add_class("hidden")
 
-    # ----- actions -----
+    def action_close_report(self) -> None:
+        """Esc: esce dalla vista report e torna ai dettagli evento."""
+        if self._detail_override_text is None:
+            return
+        self._detail_override_text = None
+        self._detail_override_event_id = None
+        self._update_detail()
+
     def action_start_monitor(self) -> None:
         try:
             subprocess.run(["argus", "start"], timeout=2)
@@ -273,13 +282,11 @@ class ArgusApp(App):
         self._refresh()
 
     def action_clear_events(self) -> None:
-        """K: pulisce eventi (DB + UI)."""
         lv = self.query_one("#feed", ListView)
         overlay = self.query_one("#overlay", Static)
         summary = self.query_one("#summary", Static)
         detail_text = self.query_one("#detail_text", Static)
 
-        # UI subito
         lv.clear()
         overlay.update("")
         summary.update("")
@@ -287,7 +294,9 @@ class ArgusApp(App):
         self._selected = None
         self._last_feed_sig = (-1, -1)
 
-        # DB (events + first_seen)
+        self._detail_override_text = None
+        self._detail_override_event_id = None
+
         try:
             db.clear_all_events()
         except Exception as e:
@@ -316,13 +325,33 @@ class ArgusApp(App):
             lv.index = min(len(lv.children) - 1, lv.index + 1)
 
     def action_open_selected(self) -> None:
+        detail_text = self.query_one("#detail_text", Static)
         if not self._selected:
             return
+
         e = self._selected.event
-        db.add_event(code="SYS", severity="INFO",
-                     message=f"Apri: report non ancora implementato (selezionato {e.get('code')}).",
-                     entity="tui")
-        self._refresh()
+        eid = int(e.get("id") or 0)
+        md_path = (e.get("report_md_path") or "").strip()
+        if not md_path:
+            db.add_event(code="SYS", severity="INFO", message="Report: nessun report associato a questo evento.", entity="tui")
+            self._refresh()
+            return
+
+        p = Path(md_path)
+        if not p.exists():
+            db.add_event(code="SYS", severity="WARNING", message=f"Report non trovato su disco: {md_path}", entity="tui")
+            self._refresh()
+            return
+
+        try:
+            txt = p.read_text(encoding="utf-8")
+        except Exception as ex:
+            txt = f"Errore lettura report: {ex!r}\nPath: {md_path}"
+
+        # Override: resta visibile anche con refresh ogni 1s
+        self._detail_override_text = txt
+        self._detail_override_event_id = eid
+        detail_text.update(txt)
 
     def action_trust_selected(self) -> None:
         if not self._selected:
@@ -353,14 +382,18 @@ class ArgusApp(App):
         db.add_event(code="SYS", severity="INFO", message=f"Trust SEC-04: {out}", entity="tui")
         self._refresh()
 
-    # ----- listview highlight -----
     def on_list_view_highlighted(self, message: ListView.Highlighted) -> None:
         item = message.item
         if isinstance(item, EventRow):
+            new_id = int(item.event.get("id") or 0)
+            # Se cambi selezione, esci dalla vista report
+            if self._detail_override_event_id is not None and self._detail_override_event_id != new_id:
+                self._detail_override_text = None
+                self._detail_override_event_id = None
+
             self._selected = Selected(event=item.event)
             self._update_detail()
 
-    # ----- detail panel -----
     def _update_detail(self) -> None:
         detail_text = self.query_one("#detail_text", Static)
         if not self._selected:
@@ -368,37 +401,43 @@ class ArgusApp(App):
             return
 
         e = self._selected.event
+        eid = int(e.get("id") or 0)
+
+        # Se stiamo mostrando il report per questo evento, non sovrascrivere.
+        if self._detail_override_text is not None and self._detail_override_event_id == eid:
+            detail_text.update(self._detail_override_text)
+            return
+
         ts = datetime.fromtimestamp(int(e["ts"])).strftime("%Y-%m-%d %H:%M:%S")
         sev = (e.get("severity") or "INFO").upper()
         code = (e.get("code") or "")
         ent = (e.get("entity") or "")
         msg = (e.get("message") or "").strip()
 
-        icon = CODE_ICON.get(code, "•")
-        sev_i = SEV_ICON.get(sev, "•")
-        color = SEV_STYLE.get(sev, "white")
-
         advice = ADVICE.get(code, [])
         advice_txt = "\n".join([f"  • {a}" for a in advice]) if advice else "  • (azioni consigliate: in arrivo)"
+        has_report = "SI" if (e.get("report_md_path") or "").strip() else "NO"
 
         detail_text.update(
             "\n".join(
                 [
-                    f"[bold]{icon} {code}[/bold]  [{color}]{sev_i} {sev}[/{color}]",
-                    f"[dim]{ts}[/dim]",
+                    f"{code} ({sev})",
+                    f"{ts}",
                     "",
-                    f"[bold]Cosa è successo[/bold]\n  {msg}",
+                    "Cosa è successo",
+                    f"  {msg}",
                     "",
-                    f"[bold]Entità[/bold]\n  {ent if ent else '(n/a)'}",
+                    "Entità",
+                    f"  {ent if ent else '(n/a)'}",
                     "",
-                    f"[bold]Cosa fare ora[/bold]\n{advice_txt}",
+                    "Cosa fare ora",
+                    f"{advice_txt}",
                     "",
-                    "[dim]Suggerimento: se il testo è lungo, scorri nel pannello Dettagli.[/dim]",
+                    f"Report associato: {has_report}  (premi Enter per aprire, Esc per tornare)",
                 ]
             )
         )
 
-    # ----- footer -----
     def _update_footerbar(self) -> None:
         footer = self.query_one("#footerbar", Static)
         view = "Dash" if self.view_mode == "dashboard" else "Min"
@@ -413,12 +452,10 @@ class ArgusApp(App):
         flags_txt = (" | " + "/".join(flags)) if flags else ""
 
         footer.update(
-            f"[bold]S[/bold] Start  [bold]X[/bold] Stop  [bold]D[/bold] Dettagli  [bold]V[/bold] Vista  "
-            f"[bold]T[/bold] Trust  [bold]K[/bold] Pulisci  [bold]M[/bold] Maint  [bold]U[/bold] Mute  [bold]Q[/bold] Quit"
-            f"    [dim]{run} | {view} | {det}{flags_txt}[/dim]"
+            f"S Start  X Stop  D Dettagli  V Vista  T Trust  K Pulisci  M Maint  U Mute  Enter Report  Esc Back  Q Quit"
+            f"    {run} | {view} | {det}{flags_txt}"
         )
 
-    # ----- refresh loop -----
     def _refresh(self) -> None:
         db.init_db()
 
@@ -432,7 +469,7 @@ class ArgusApp(App):
         midnight = _midnight_ts()
 
         all_recent = db.list_events(limit=500)
-        visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]  # hide SYS
+        visible = [e for e in all_recent if (e.get("code") or "") != "SYS"]
 
         top_id = int(visible[0]["id"]) if visible else 0
         feed_sig = (top_id, len(visible))
@@ -451,7 +488,7 @@ class ArgusApp(App):
         crit_now = [e for e in last_10m if (e.get("severity") or "").upper() == "CRITICAL"]
         crit_now = sorted(crit_now, key=lambda x: int(x["ts"]), reverse=True)[:3]
         if crit_now:
-            lines = ["[bold red]ATTIVI ORA[/bold red]"]
+            lines = ["ATTIVI ORA"]
             for e in crit_now:
                 lines.append("  " + _fmt_event_line(e))
             overlay.update("\n".join(lines))
@@ -471,17 +508,17 @@ class ArgusApp(App):
             sec04_today = db.list_first_seen(prefix="sec04|", since_ts=midnight, limit=5)
 
             out: List[str] = []
-            out.append("[bold]Sicurezza (oggi)[/bold]")
+            out.append("Sicurezza (oggi)")
             any_sec = False
             for c in ["SEC-01", "SEC-02", "SEC-03", "SEC-04", "SEC-05"]:
                 if c in counts_today:
                     any_sec = True
-                    out.append(f"  {CODE_ICON.get(c,'•')} [dim]{c}[/dim]  x{counts_today[c]}")
+                    out.append(f"  {CODE_ICON.get(c,'•')} {c}  x{counts_today[c]}")
             if not any_sec:
                 out.append("  (nessun evento SEC oggi)")
 
             out.append("")
-            out.append("[bold]SEC-03 — Sudo insoliti visti oggi[/bold] (first-seen)")
+            out.append("SEC-03 — Sudo insoliti visti oggi (first-seen)")
             if not sec03_today:
                 out.append("  (nessuna novità oggi)")
             else:
@@ -490,10 +527,10 @@ class ArgusApp(App):
                     user, cmd = _parse_sec03_key(row.get("key", ""))
                     cnt = int(row.get("count", 1))
                     cmd_s = cmd if len(cmd) <= 70 else cmd[:67] + "..."
-                    out.append(f"  {t}  🧨  [bold]{user}[/bold]  {cmd_s}  (x{cnt})")
+                    out.append(f"  {t}  🧨  {user}  {cmd_s}  (x{cnt})")
 
             out.append("")
-            out.append("[bold]SEC-04 — Nuove porte/servizi visti oggi[/bold] (first-seen)")
+            out.append("SEC-04 — Nuove porte/servizi visti oggi (first-seen)")
             if not sec04_today:
                 out.append("  (nessuna novità oggi)")
             else:

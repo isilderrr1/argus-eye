@@ -21,7 +21,6 @@ def connect() -> sqlite3.Connection:
     paths.ensure_dirs()
     conn = sqlite3.connect(paths.db_file())
     conn.row_factory = sqlite3.Row
-    # Aiuta a ridurre errori sporadici "database is locked" (thread/poller)
     conn.execute("PRAGMA busy_timeout=2000;")
     return conn
 
@@ -134,8 +133,18 @@ def remaining_seconds(key: str) -> Optional[int]:
 
 
 # -------------------------
-# Events (feed)
+# Events (feed + report)
 # -------------------------
+def attach_report_paths(event_id: int, md_path: str, json_path: str) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE events SET report_md_path = ?, report_json_path = ? WHERE id = ?",
+            (md_path, json_path, event_id),
+        )
+        conn.commit()
+
+
 def add_event(
     code: str,
     severity: str,
@@ -146,19 +155,42 @@ def add_event(
 ) -> int:
     """
     Inserisce un evento in tabella events.
-    Ritorna l'id dell'evento inserito.
+    Auto-genera un report (MD+JSON) per eventi SEC/HEA.
     """
     init_db()
+    ts = _now()
+
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO events(ts, code, severity, message, entity, details_json, is_active)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (_now(), code, severity, message, entity, details_json, is_active),
+            (ts, code, severity, message, entity, details_json, is_active),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        event_id = int(cur.lastrowid)
+
+    # Reporter (best effort)
+    try:
+        if (code or "").startswith(("SEC-", "HEA-")):
+            from argus import reporter
+            ev = {
+                "id": event_id,
+                "ts": ts,
+                "code": code,
+                "severity": severity,
+                "message": message,
+                "entity": entity,
+                "details_json": details_json,
+            }
+            md_path, json_path = reporter.write_report(ev)
+            attach_report_paths(event_id, md_path, json_path)
+    except Exception:
+        # Non blocchiamo la pipeline: il feed deve continuare a funzionare.
+        pass
+
+    return event_id
 
 
 def list_events(limit: int = 10) -> List[Dict[str, Any]]:
@@ -167,8 +199,41 @@ def list_events(limit: int = 10) -> List[Dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, ts, code, severity, message, entity, is_active, ended_ts
+            SELECT id, ts, code, severity, message, entity, details_json,
+                   report_md_path, report_json_path, is_active, ended_ts
             FROM events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_event(event_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, ts, code, severity, message, entity, details_json,
+                   report_md_path, report_json_path, is_active, ended_ts
+            FROM events
+            WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_report_events(limit: int = 10) -> List[Dict[str, Any]]:
+    """Eventi che hanno un report associato (md_path non nullo)."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ts, code, severity, message, entity, report_md_path, report_json_path
+            FROM events
+            WHERE report_md_path IS NOT NULL AND report_md_path <> ''
             ORDER BY id DESC
             LIMIT ?
             """,

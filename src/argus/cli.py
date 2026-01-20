@@ -3,13 +3,14 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 
 import typer
 
 from argus import __version__, paths, db
 from argus.collectors.authlog import tail_file
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
-from argus.monitor import run_authlog_security  # <-- import corretto
+from argus.monitor import run_authlog_security
 
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
@@ -100,7 +101,7 @@ def stop():
 @app.command()
 def mute(duration: str = typer.Argument("10m", help="Esempio: 10m, 30m, 1h")):
     """Silenzia popup (solo CRITICAL) per un periodo."""
-    ttl = parse_duration(duration)  # <-- FIX: ttl è DURATA, non timestamp assoluto
+    ttl = parse_duration(duration)
     db.set_flag("mute", "1", ttl_seconds=ttl)
     typer.echo(f"MUTE attivo per {duration}")
 
@@ -111,6 +112,18 @@ def maintenance(duration: str = typer.Argument("30m", help="Esempio: 30m, 1h")):
     ttl = parse_duration(duration)
     db.set_flag("maintenance", "1", ttl_seconds=ttl)
     typer.echo(f"MAINTENANCE attivo per {duration}")
+
+
+@app.command()
+def run(
+    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
+):
+    """Esegui il monitor in foreground."""
+    set_state("RUNNING")
+    try:
+        run_authlog_security(log_path=log_path)
+    finally:
+        set_state("STOPPED")
 
 
 @app.command()
@@ -141,16 +154,6 @@ def sec02(
         raise
     except KeyboardInterrupt:
         typer.echo("\n[argus] Stop richiesto dall'utente. (CTRL+C)")
-
-
-@app.command()
-def run(
-    log_path: str = typer.Option("/var/log/auth.log", help="Path log SSH (Ubuntu: /var/log/auth.log)"),
-):
-    """Esegui il monitor in foreground (SEC-01) leggendo i log reali."""
-    set_state("RUNNING")
-    try:
-        run_authlog_security(log_path=log_path)
     finally:
         set_state("STOPPED")
 
@@ -173,3 +176,37 @@ def events(
         if len(msg) > 140:
             msg = msg[:137] + "..."
         typer.echo(f"{ts}  {sev:<8} {code:<6} {msg}")
+
+
+@app.command("report")
+def report(
+    last: int = typer.Option(1, "--last", "-n", help="Mostra l'ultimo report o lista gli ultimi N"),
+):
+    """
+    Mostra l'ultimo report (default) oppure lista gli ultimi N report.
+    """
+    rows = db.list_report_events(limit=max(1, last))
+    if not rows:
+        typer.echo("Nessun report trovato (genera un evento SEC/HEA e riprova).")
+        raise typer.Exit()
+
+    if last > 1:
+        for r in rows:
+            ts = datetime.fromtimestamp(int(r["ts"])).strftime("%Y-%m-%d %H:%M:%S")
+            code = (r.get("code") or "")
+            sev = (r.get("severity") or "").upper()
+            md = r.get("report_md_path") or ""
+            typer.echo(f"{ts}  {sev:<8} {code:<6}  {md}")
+        raise typer.Exit()
+
+    md_path = rows[0].get("report_md_path") or ""
+    if not md_path:
+        typer.echo("Ultimo evento non ha un report associato.")
+        raise typer.Exit()
+
+    p = Path(md_path)
+    if not p.exists():
+        typer.echo(f"Report non trovato su disco: {md_path}")
+        raise typer.Exit()
+
+    typer.echo(p.read_text(encoding="utf-8"))
