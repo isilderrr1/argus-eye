@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import platform
-import random
 import re
 import socket
 import subprocess
@@ -188,7 +187,7 @@ def _get_lan_ip() -> str:
                 ips.append(ip)
 
         def is_lan(ip: str) -> bool:
-            return ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.")
+            return ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.") or ip.startswith("169.254.")
 
         for ip in ips:
             if is_lan(ip):
@@ -206,7 +205,7 @@ def _get_lan_ip() -> str:
 
 
 def _logo_argus_lines() -> List[str]:
-    # 7-high, very readable block letters: ARGUS
+    # 7-high readable block letters: ARGUS
     A = [
         "   ███   ",
         "  █   █  ",
@@ -262,7 +261,6 @@ def _logo_argus_lines() -> List[str]:
 def _splash_body_lines() -> List[str]:
     return [
         "",
-        "",
         "[bold]What it is[/bold]",
         "ARGUS is a Linux desktop monitor for security + system health.",
         "It keeps the UI clean and sends desktop popups only for CRITICAL events.",
@@ -293,7 +291,7 @@ class ArgusApp(App):
 
     /* Splash */
     #splash { height: 1fr; border: round $surface; }
-    #splash_banner { height: 2; padding: 0 2; }
+    #splash_banner { height: 3; padding: 0 2; }
     #splash_matrix { height: 12; padding: 0 2; }
     #splash_body { height: 1fr; padding: 0 2; }
 
@@ -309,7 +307,7 @@ class ArgusApp(App):
     #detail_box { width: 1fr; height: 1fr; border: round $surface; }
     #detail_text { padding: 1 2; }
 
-    #footerbar { height: 1; padding: 0 1; background: $surface; color: $text; }
+    #footerbar { height: 2; padding: 0 1; background: #001400; color: #00ff66; }
 
     .hidden { display: none; }
     """
@@ -321,27 +319,20 @@ class ArgusApp(App):
     _selected: Optional[Selected] = None
     _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
 
-    # report override
     _detail_override_text: Optional[str] = None
     _detail_override_event_id: Optional[int] = None
 
-    # matrix/logo state
-    _matrix_w: int = 0
-    _matrix_h: int = 0
-    _matrix_cols: List[List[str]]
-    _matrix_energy: List[int]
-    _matrix_chars: str = "01abcdef+-*/<>$#@"
-    _logo_targets: Dict[Tuple[int, int], str]
-    _logo_locked: set[Tuple[int, int]]
-    _logo_done: bool = False
+    # splash caching (avoid rebuilding banner every frame)
+    _last_banner_text: str = ""
+    _last_banner_update_ts: float = 0.0
 
     BINDINGS = [
         ("s", "start_monitor", "Start"),
         ("x", "stop_monitor", "Stop"),
-        ("d", "toggle_details", "Dettagli"),
-        ("v", "toggle_view", "Vista"),
+        ("d", "toggle_details", "Details"),
+        ("v", "toggle_view", "View"),
         ("t", "trust_selected", "Trust"),
-        ("k", "clear_events", "Pulisci"),
+        ("k", "clear_events", "Clear"),
         ("m", "maintenance_30", "Maint 30m"),
         ("u", "mute_10", "Mute 10m"),
         ("q", "quit", "Quit"),
@@ -367,15 +358,10 @@ class ArgusApp(App):
 
     def on_mount(self) -> None:
         db.init_db()
-
-        self._logo_targets = {}
-        self._logo_locked = set()
-        self._logo_done = False
-
         self._apply_global_visibility()
-        self._render_splash()
+        self._render_splash(force_banner=True)
 
-        self.set_interval(0.06, self._tick_splash)  # matrix animation
+        self.set_interval(0.06, self._tick_splash)  # splash animation
         self.set_interval(1.0, self._refresh)       # main refresh
 
     # -------- Key handling (robust Enter/Esc) --------
@@ -387,13 +373,11 @@ class ArgusApp(App):
                 self.action_continue()
                 event.stop()
                 return
-            # main: Enter opens report (even if ListView consumes Enter)
             self.action_open_selected()
             event.stop()
             return
 
         if k == "escape":
-            # close report view if open
             self.action_close_report()
             event.stop()
             return
@@ -427,24 +411,20 @@ class ArgusApp(App):
         line0 = "[bold green]ARGUS[/bold green]  [dim]— Argus watches. You decide.[/dim]"
         line1 = "[bold cyan]OPERATOR[/bold cyan]  [bold]Antonio Ruocco[/bold]"
         line2 = f"[dim]root@{host} | v{ARGUS_VERSION} | kernel {kernel} | uptime {up} | ip {ip}[/dim]"
-
         return "\n".join((line0, line1, line2))
 
-    def _ensure_matrix(self) -> None:
-        w = max(48, min(self.size.width - 6, 120))
-        h = 12  # not too compact + space for description
-        if self._matrix_w == w and self._matrix_h == h and hasattr(self, "_matrix_cols"):
+    # ---------------- Digit-cascade (ARGUS made of 0/1 encoding "I watch U") ----------------
+    def _dm_ensure(self) -> None:
+        # keep one-screen compact
+        w = max(56, min(self.size.width - 6, 120))
+        h = 12
+
+        if getattr(self, "_dm_w", None) == w and getattr(self, "_dm_h", None) == h:
             return
 
-        self._matrix_w = w
-        self._matrix_h = h
-        self._matrix_cols = [[" "] * h for _ in range(w)]
-        self._matrix_energy = [0] * w
-
-        # build logo target positions centered
-        self._logo_targets = {}
-        self._logo_locked = set()
-        self._logo_done = False
+        self._dm_w = w
+        self._dm_h = h
+        self._dm_done = False
 
         logo = _logo_argus_lines()
         lh = len(logo)
@@ -453,71 +433,88 @@ class ArgusApp(App):
         x0 = max(0, (w - lw) // 2)
         y0 = max(0, (h - lh) // 2)
 
-        for y in range(lh):
-            row = logo[y]
-            for x in range(lw):
-                ch = row[x]
-                if ch != " ":
-                    self._logo_targets[(x0 + x, y0 + y)] = ch
+        targets: List[Tuple[int, int]] = []
+        targets_by_col: Dict[int, List[int]] = {}
 
-    def _matrix_step(self) -> None:
-        self._ensure_matrix()
-        if self._logo_done:
+        for y in range(lh):
+            for x in range(lw):
+                if logo[y][x] != " ":
+                    tx, ty = x0 + x, y0 + y
+                    targets.append((tx, ty))
+                    targets_by_col.setdefault(tx, []).append(ty)
+
+        for x in targets_by_col:
+            targets_by_col[x] = sorted(targets_by_col[x])  # top->bottom
+
+        self._dm_targets = set(targets)
+        self._dm_targets_by_col = targets_by_col
+
+        self._dm_filled = {}   # (x,y) -> digit
+        self._dm_falling = {}  # x -> (y, digit, target_y)
+
+        # map each target cell to a bit (ASCII bits of "I watch U")
+        msg = "I watch U"
+        bits = "".join(f"{b:08b}" for b in msg.encode("ascii"))
+        ordered = sorted(targets, key=lambda t: (t[1], t[0]))  # row-major
+        self._dm_target_digit = {pos: bits[i % len(bits)] for i, pos in enumerate(ordered)}
+
+    def _dm_step(self) -> None:
+        self._dm_ensure()
+        if self._dm_done:
             return
 
-        w, h = self._matrix_w, self._matrix_h
-
-        for x in range(w):
-            col = self._matrix_cols[x]
-            energy = self._matrix_energy[x]
-
-            # start a falling streak sometimes
-            if energy <= 0 and random.random() < 0.12:
-                energy = random.randint(5, 14)
-
-            ch = random.choice(self._matrix_chars) if energy > 0 else " "
-            if energy > 0:
-                energy -= 1
-
-            # shift down
-            col.pop()
-            col.insert(0, ch)
-            self._matrix_energy[x] = energy
-
-        # lock letters when a falling char reaches a target cell
-        for (tx, ty), target_ch in self._logo_targets.items():
-            if (tx, ty) in self._logo_locked:
-                self._matrix_cols[tx][ty] = target_ch
+        # spawn per column if needed (one falling digit per column)
+        for x, ys in self._dm_targets_by_col.items():
+            if x in self._dm_falling:
                 continue
 
-            current = self._matrix_cols[tx][ty]
-            if current != " ":
-                # a falling char arrived here -> "settle" into the logo
-                self._logo_locked.add((tx, ty))
-                self._matrix_cols[tx][ty] = target_ch
+            next_ty = None
+            for ty in ys:
+                if (x, ty) not in self._dm_filled:
+                    next_ty = ty
+                    break
+            if next_ty is None:
+                continue
 
-        if len(self._logo_locked) >= len(self._logo_targets) and self._logo_targets:
-            # stop animation once the logo is fully built
-            self._logo_done = True
+            d = self._dm_target_digit.get((x, next_ty), "0")
+            self._dm_falling[x] = (-1, d, next_ty)
 
-    def _matrix_render_text(self) -> Text:
-        self._ensure_matrix()
-        w, h = self._matrix_w, self._matrix_h
+        # advance + lock
+        new_falling = {}
+        for x, (y, d, ty) in self._dm_falling.items():
+            y2 = y + 1
+            if y2 >= ty:
+                self._dm_filled[(x, ty)] = d
+            else:
+                new_falling[x] = (y2, d, ty)
+        self._dm_falling = new_falling
 
-        rows: List[str] = []
-        for y in range(h):
-            rows.append("".join(self._matrix_cols[x][y] for x in range(w)))
-        s = "\n".join(rows)
+        if self._dm_targets and len(self._dm_filled) >= len(self._dm_targets):
+            self._dm_done = True
 
-        t = Text(s, style="green")
-        # make logo a bit brighter (bold) by styling target cells
-        # (best-effort; if terminal doesn't support, still ok)
-        if self._logo_targets:
-            for (x, y) in self._logo_targets.keys():
-                idx = y * (w + 1) + x  # +1 for newline
-                if 0 <= idx < len(t):
-                    t.stylize("bold green", idx, idx + 1)
-        return t
+    def _dm_render(self) -> Text:
+        self._dm_ensure()
+        w, h = self._dm_w, self._dm_h
+
+        grid = [[" " for _ in range(w)] for _ in range(h)]
+
+        for (x, y), d in self._dm_filled.items():
+            if 0 <= x < w and 0 <= y < h:
+                grid[y][x] = d
+
+        for x, (y, d, _ty) in self._dm_falling.items():
+            if 0 <= x < w and 0 <= y < h and grid[y][x] == " ":
+                grid[y][x] = d
+
+        txt = Text("\n".join("".join(r) for r in grid), style="green")
+
+        # bold target cells so ARGUS pops
+        for (x, y) in self._dm_targets:
+            idx = y * (w + 1) + x
+            if 0 <= idx < len(txt):
+                txt.stylize("bold green", idx, idx + 1)
+
+        return txt
 
     def _splash_ready_line(self) -> str:
         total = len(getattr(self, "_dm_targets", [])) or 1
@@ -548,133 +545,28 @@ class ArgusApp(App):
         txt += "\n\n" + self._splash_ready_line()
         return txt
 
-    def _render_splash(self) -> None:
+    def _render_splash(self, force_banner: bool = False) -> None:
         banner = self.query_one("#splash_banner", Static)
         matrix = self.query_one("#splash_matrix", Static)
         body = self.query_one("#splash_body", Static)
 
-        banner.update(self._splash_banner_text())
-        matrix.update(self._dm_render())
+        # banner: update at most twice per second (uptime changes)
+        now = time.time()
+        if force_banner or (now - self._last_banner_update_ts) >= 0.5:
+            btxt = self._splash_banner_text()
+            if btxt != self._last_banner_text:
+                banner.update(btxt)
+                self._last_banner_text = btxt
+            self._last_banner_update_ts = now
 
-        lines = _splash_body_lines()
-        if self._logo_done:
-            lines = lines + ["", "[READY] ARGUS logo locked. Press Enter."]
+        matrix.update(self._dm_render())
         body.update(self._splash_body_render_text())
 
     def _tick_splash(self) -> None:
         if self.ui_mode != "splash":
             return
-        self._matrix_step()
         self._dm_step()
         self._render_splash()
-
-
-    # ---------------- Digit-cascade Splash (ARGUS made of numbers) ----------------
-    def _dm_ensure(self) -> None:
-        import random
-
-        # matrix area (keep compact: one screen)
-        w = max(56, min(self.size.width - 6, 120))
-        h = 12
-
-        if getattr(self, "_dm_w", None) == w and getattr(self, "_dm_h", None) == h:
-            return
-
-        self._dm_w = w
-        self._dm_h = h
-        self._dm_done = False
-
-        # targets from logo mask (non-space pixels)
-        logo = _logo_argus_lines()
-        lh = len(logo)
-        lw = len(logo[0]) if logo else 0
-
-        x0 = max(0, (w - lw) // 2)
-        y0 = max(0, (h - lh) // 2)
-
-        targets = []
-        targets_by_col = {}
-        for y in range(lh):
-            for x in range(lw):
-                if logo[y][x] != " ":
-                    tx, ty = x0 + x, y0 + y
-                    targets.append((tx, ty))
-                    targets_by_col.setdefault(tx, []).append(ty)
-
-        for x in targets_by_col:
-            targets_by_col[x] = sorted(targets_by_col[x])  # top->bottom
-
-        self._dm_targets = set(targets)
-        self._dm_targets_by_col = targets_by_col
-
-        # filled digits on targets + falling per column
-        self._dm_filled = {}   # (x,y) -> digit
-        self._dm_falling = {}  # x -> (y, digit, target_y)
-        self._dm_digits = "0123456789"
-
-    def _dm_step(self) -> None:
-        import random
-
-        self._dm_ensure()
-        if self._dm_done:
-            return
-
-        # spawn per column if needed
-        for x, ys in self._dm_targets_by_col.items():
-            if x in self._dm_falling:
-                continue
-
-            next_ty = None
-            for ty in ys:
-                if (x, ty) not in self._dm_filled:
-                    next_ty = ty
-                    break
-            if next_ty is None:
-                continue
-
-            d = random.choice(self._dm_digits)
-            self._dm_falling[x] = (-1, d, next_ty)  # start above top
-
-        # advance + lock
-        new_falling = {}
-        for x, (y, d, ty) in self._dm_falling.items():
-            y2 = y + 1
-            if y2 >= ty:
-                self._dm_filled[(x, ty)] = d
-            else:
-                new_falling[x] = (y2, d, ty)
-        self._dm_falling = new_falling
-
-        if self._dm_targets and len(self._dm_filled) >= len(self._dm_targets):
-            self._dm_done = True
-
-    def _dm_render(self):
-        from rich.text import Text
-
-        self._dm_ensure()
-        w, h = self._dm_w, self._dm_h
-
-        grid = [[" " for _ in range(w)] for _ in range(h)]
-
-        # locked digits (logo)
-        for (x, y), d in self._dm_filled.items():
-            if 0 <= x < w and 0 <= y < h:
-                grid[y][x] = d
-
-        # falling digits
-        for x, (y, d, _ty) in self._dm_falling.items():
-            if 0 <= x < w and 0 <= y < h and grid[y][x] == " ":
-                grid[y][x] = d
-
-        txt = Text("\n".join("".join(r) for r in grid), style="green")
-
-        # bold target cells (so ARGUS pops)
-        for (x, y) in self._dm_targets:
-            idx = y * (w + 1) + x
-            if 0 <= idx < len(txt):
-                txt.stylize("bold green", idx, idx + 1)
-
-        return txt
 
     # ---------------- Main UI ----------------
     def action_toggle_view(self) -> None:
@@ -799,7 +691,6 @@ class ArgusApp(App):
     def action_open_selected(self) -> None:
         if self.ui_mode != "main":
             return
-
         if not self._selected:
             return
 
@@ -922,25 +813,61 @@ class ArgusApp(App):
             return
 
         footer = self.query_one("#footerbar", Static)
-        view = "Dash" if self.view_mode == "dashboard" else "Min"
-        det = "Det ON" if (self.view_mode == "dashboard" and self.show_details and self.size.width >= 100) else "Det OFF"
-        run = _status_runstop()
+
+        # Marker: se NON lo vedi, non stai usando questo footer
+        marker = "[bold #00ff66]FOOTER_V2[/bold #00ff66]"
+
+        def cap(key: str, bg: str = "#00ff66") -> str:
+            return f"[bold black on {bg}] {key} [/bold black on {bg}]"
+
+        def cap_dim(key: str) -> str:
+            return f"[bold white on #143314] {key} [/bold white on #143314]"
+
+        run_line = _status_runstop()  # es: "STATE: RUNNING"
+        state = run_line.split(":", 1)[1].strip() if ":" in run_line else run_line.strip()
+        state = state or "UNKNOWN"
+
+        state_col = "#00ff66" if "RUN" in state.upper() else ("#ff5555" if "STOP" in state.upper() else "#ffff66")
+
+        view = "Dashboard" if self.view_mode == "dashboard" else "Minimal"
+        det_on = (self.view_mode == "dashboard" and self.show_details and self.size.width >= 100)
+        det = "ON" if det_on else "OFF"
 
         flags = []
         if _flag_badge("mute"):
-            flags.append("MUTE")
+            flags.append("[yellow]MUTE[/yellow]")
         if _flag_badge("maintenance"):
-            flags.append("MAINT")
-        flags_txt = (" | " + "/".join(flags)) if flags else ""
+            flags.append("[cyan]MAINT[/cyan]")
+        flags_txt = " ".join(flags) if flags else "[dim]none[/dim]"
 
-        footer.update(
-            f"S Start  X Stop  D Details  V View  T Trust  K Clear  M Maint  U Mute  Enter Report  Esc Back  Q Quit"
-            f"    {run} | {view} | {det}{flags_txt}"
+        # Riga 1: comandi (spaziati + keycaps)
+        line1 = (
+            f"{marker}  "
+            f"{cap('S','green')}[dim]Start[/dim]  "
+            f"{cap('X','#ff3333')}[dim]Stop[/dim]  "
+            f"{cap('D','cyan')}[dim]Details[/dim]  "
+            f"{cap('V','#cc66ff')}[dim]View[/dim]  "
+            f"{cap('T','yellow')}[dim]Trust[/dim]  "
+            f"{cap_dim('K')}[dim]Clear[/dim]  "
+            f"{cap('M','#3399ff')}[dim]Maint[/dim]  "
+            f"{cap_dim('U')}[dim]Mute[/dim]  "
+            f"{cap('Enter','green')}[dim]Report[/dim]  "
+            f"{cap_dim('Esc')}[dim]Back[/dim]  "
+            f"{cap('Q','#ff3333')}[dim]Quit[/dim]"
         )
 
-    def _refresh(self) -> None:
-        db.init_db()
+        # Riga 2: stato pulito
+        line2 = (
+            f"[dim]—[/dim] "
+            f"[bold]STATE[/bold] [{state_col}]{state}[/{state_col}]  "
+            f"[dim]|[/dim] [bold]VIEW[/bold] {view}  "
+            f"[dim]|[/dim] [bold]DETAILS[/bold] {det}  "
+            f"[dim]|[/dim] [bold]FLAGS[/bold] {flags_txt}"
+        )
 
+        footer.update(line1 + "\\n" + line2)
+
+    def _refresh(self) -> None:
         if self.ui_mode != "main":
             return
 
