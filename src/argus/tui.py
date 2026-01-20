@@ -519,6 +519,19 @@ class ArgusApp(App):
                     t.stylize("bold green", idx, idx + 1)
         return t
 
+    def _splash_ready_line(self) -> str:
+        return (
+            "[green][ OK ][/green] detectors armed  ·  "
+            "[green][ OK ][/green] reports enabled  ·  "
+            "[bold green][ READY ][/bold green] press Enter"
+        )
+
+    def _splash_body_render_text(self) -> str:
+        txt = "\n".join(_splash_body_lines())
+        if getattr(self, "_dm_done", False):
+            txt += "\n\n" + self._splash_ready_line()
+        return txt
+
     def _render_splash(self) -> None:
         banner = self.query_one("#splash_banner", Static)
         matrix = self.query_one("#splash_matrix", Static)
@@ -530,7 +543,7 @@ class ArgusApp(App):
         lines = _splash_body_lines()
         if self._logo_done:
             lines = lines + ["", "[READY] ARGUS logo locked. Press Enter."]
-        body.update("\n".join(lines))
+        body.update(self._splash_body_render_text())
 
     def _tick_splash(self) -> None:
         if self.ui_mode != "splash":
