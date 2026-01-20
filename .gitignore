@@ -11,3 +11,10 @@ __pycache__/
 dist/
 build/
 *.bak
+
+# Local secrets / tokens
+token.txt
+*.token
+*.secret
+*.env
+.env.*
