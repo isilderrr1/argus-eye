@@ -520,17 +520,32 @@ class ArgusApp(App):
         return t
 
     def _splash_ready_line(self) -> str:
-        # Hacker-green (RGB) + badge con background per staccare anche su temi diversi
-        ok = "[#00ff00][ OK ][/#00ff00]"
-        dot = "[dim]·[/dim]"
-        ready = "[bold black on #00ff00]  READY  [/bold black on #00ff00]"
-        msg = "[#00ff00]press Enter[/#00ff00]"
-        return f"{ok} [#00ff00]detectors armed[/#00ff00]  {dot}  {ok} [#00ff00]reports enabled[/#00ff00]  {dot}  {ready} {msg}"
+        total = len(getattr(self, "_dm_targets", [])) or 1
+        filled = len(getattr(self, "_dm_filled", {})) or 0
+        pct = int(min(100, (filled * 100) / total))
+        done = bool(getattr(self, "_dm_done", False)) or pct >= 100
+
+        width = 28
+        fill_n = int((pct * width) / 100)
+        bar_f = "█" * fill_n
+        bar_e = "░" * (width - fill_n)
+
+        if done:
+            badge = "[bold black on #00ff00] READY [/bold black on #00ff00]"
+            tail = "[#00ff00]press Enter[/#00ff00]"
+        else:
+            badge = "[dim]BOOT[/dim]"
+            tail = "[dim]initializing...[/dim]"
+
+        return (
+            f"{badge} "
+            f"[#00ff00]{bar_f}[/#00ff00][dim]{bar_e}[/dim]  "
+            f"[#00ff00]{pct:3d}%[/#00ff00]  {tail}"
+        )
 
     def _splash_body_render_text(self) -> str:
         txt = "\n".join(_splash_body_lines())
-        if getattr(self, "_dm_done", False):
-            txt += "\n\n" + self._splash_ready_line()
+        txt += "\n\n" + self._splash_ready_line()
         return txt
 
     def _render_splash(self) -> None:
