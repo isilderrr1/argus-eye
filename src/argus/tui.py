@@ -21,6 +21,8 @@ from argus import __version__ as ARGUS_VERSION
 from argus import db
 from argus.trust import add_sec04_trust
 
+from argus.collectors.temperature import format_cpu_temp
+
 
 CODE_ICON: Dict[str, str] = {
     "SEC-01": "🚫🔑",
@@ -982,7 +984,7 @@ class ArgusApp(App):
         threat = _score(last_10m, "SEC-")
         health = _score(last_10m, "HEA-")
 
-        temp = "--°C"
+        temp = format_cpu_temp()
         disk = "--%"
 
         run = _status_runstop()

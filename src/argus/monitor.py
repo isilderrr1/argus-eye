@@ -5,6 +5,8 @@ import time
 import typer
 
 from argus import db
+from argus.collectors.temperature import read_cpu_temp_c
+from argus.detectors.hea_temperature import TemperatureDetector
 from argus.collectors.authlog import tail_file
 from argus.detectors.sec01_ssh import SshBruteForceDetector
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
@@ -46,6 +48,20 @@ def _sec05_loop(stop: threading.Event, interval_s: int = 10) -> None:
 
         stop.wait(interval_s)
 
+def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
+    det = TemperatureDetector()
+    while not stop.is_set():
+        try:
+            t = read_cpu_temp_c()
+            if t is not None:
+                for code, sev, entity, msg in det.poll(t):
+                    db.add_event(code=code, severity=sev, message=msg, entity=entity)
+                    typer.echo(f"[{code}] {sev:<8} {entity}  {msg}")
+        except Exception as e:
+            typer.echo(f"[HEA-TEMP] ERROR    temp-scan failed: {e!r}")
+
+        stop.wait(interval_s)
+
 
 def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     """
@@ -74,6 +90,8 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     t5 = threading.Thread(target=_sec05_loop, args=(stop,), daemon=True)
     t4.start()
     t5.start()
+    tT = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
+    tT.start()
 
     time.sleep(0.2)
 
@@ -105,3 +123,5 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         stop.set()
         t4.join(timeout=2)
         t5.join(timeout=2)
+        tT.join(timeout=2)
+
