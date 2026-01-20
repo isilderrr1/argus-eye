@@ -310,6 +310,26 @@ class ArgusApp(App):
     #footerbar { height: 2; padding: 0 1; background: $surface; color: $text; }
 
     .hidden { display: none; }
+
+    /* Responsive layout profiles */
+    .wide #main { layout: horizontal; }
+    .stack #main { layout: vertical; }
+    .stack #feed { width: 1fr; height: 2fr; }
+    .stack #detail_box { width: 1fr; height: 1fr; }
+    .short #overlay { display: none; }
+    .tiny #overlay { display: none; }
+    .tiny #summary { display: none; }
+    .tiny #detail_box { display: none; }
+
+
+    /* Responsive helpers */
+    .narrow #detail_box { display: none; }
+    .narrow #summary { display: none; }
+    .short #overlay { display: none; }
+    .tiny #overlay { display: none; }
+    .tiny #summary { display: none; }
+    .tiny #hdr { height: 2; }
+
     """
 
     ui_mode = reactive("splash")        # splash|main
@@ -350,7 +370,7 @@ class ArgusApp(App):
             yield Static("", id="hdr")
             yield Static("", id="overlay")
             yield Static("", id="summary")
-            with Horizontal(id="main"):
+            with Container(id="main"):
                 yield ListView(id="feed")
                 with VerticalScroll(id="detail_box"):
                     yield Static("", id="detail_text")
@@ -363,6 +383,52 @@ class ArgusApp(App):
 
         self.set_interval(0.06, self._tick_splash)  # splash animation
         self.set_interval(1.0, self._refresh)       # main refresh
+        self._apply_responsive()
+
+
+    # ---------------- Responsive layout ----------------
+    def _apply_responsive(self) -> None:
+        w, h = self.size.width, self.size.height
+
+        # Breakpoints
+        tiny  = (w < 92) or (h < 24)
+        stack = (not tiny) and (w < 120)
+        wide  = (not tiny) and (not stack)
+        short = h < 32
+
+        scr = self.screen
+        for cls in ("wide", "stack", "tiny", "short"):
+            scr.remove_class(cls)
+        scr.add_class("tiny" if tiny else ("stack" if stack else "wide"))
+        if short:
+            scr.add_class("short")
+
+        self._layout_profile = "tiny" if tiny else ("stack" if stack else "wide")
+
+        # Preferenze utente (non perderle al resize)
+        if not hasattr(self, "_user_view_mode"):
+            self._user_view_mode = self.view_mode
+        if not hasattr(self, "_user_show_details"):
+            self._user_show_details = self.show_details
+        if not hasattr(self, "_forced_minimal"):
+            self._forced_minimal = False
+
+        if self.ui_mode == "main":
+            if tiny:
+                self._forced_minimal = True
+                self.view_mode = "minimal"
+                self.show_details = False
+            else:
+                if self._forced_minimal:
+                    self.view_mode = self._user_view_mode
+                    self.show_details = self._user_show_details
+                    self._forced_minimal = False
+
+            self._apply_visibility()
+            self._update_footerbar()
+
+    def on_resize(self, event) -> None:
+        self._apply_responsive()
 
     # -------- Key handling (robust Enter/Esc) --------
     def on_key(self, event: events.Key) -> None:
@@ -386,6 +452,7 @@ class ArgusApp(App):
     def action_continue(self) -> None:
         self.ui_mode = "main"
         self._apply_global_visibility()
+        self._apply_responsive()
         self._refresh()
         self.query_one("#feed", ListView).focus()
 
@@ -573,12 +640,14 @@ class ArgusApp(App):
         if self.ui_mode != "main":
             return
         self.view_mode = "minimal" if self.view_mode == "dashboard" else "dashboard"
+        self._user_view_mode = self.view_mode
         self._apply_visibility()
 
     def action_toggle_details(self) -> None:
         if self.ui_mode != "main":
             return
         self.show_details = not self.show_details
+        self._user_show_details = self.show_details
         self._apply_visibility()
 
     def _apply_visibility(self) -> None:
@@ -591,7 +660,8 @@ class ArgusApp(App):
             return
 
         summary.remove_class("hidden")
-        if self.show_details and self.size.width >= 100:
+        prof = getattr(self, "_layout_profile", "wide")
+        if self.show_details and (self.size.width >= 100 or prof == "stack"):
             detail_box.remove_class("hidden")
         else:
             detail_box.add_class("hidden")
@@ -814,7 +884,6 @@ class ArgusApp(App):
 
         footer = self.query_one("#footerbar", Static)
 
-        # Palette "pro" (GitHub-ish dark)
         KEY_BG = "#30363d"
         KEY_FG = "#e6edf3"
         OK_BG = "#1f6feb"
@@ -824,11 +893,10 @@ class ArgusApp(App):
         def cap(key: str, bg: str = KEY_BG) -> str:
             return f"[bold {KEY_FG} on {bg}] {key} [/bold {KEY_FG} on {bg}]"
 
-        run_line = _status_runstop()  # es: "STATE: RUNNING"
+        run_line = _status_runstop()
         state = run_line.split(":", 1)[1].strip() if ":" in run_line else run_line.strip()
         state = state or "UNKNOWN"
 
-        # colori stato (sobri)
         if "RUN" in state.upper():
             state_col = "#3fb950"
         elif "STOP" in state.upper():
@@ -837,7 +905,8 @@ class ArgusApp(App):
             state_col = "#d29922"
 
         view = "Dashboard" if self.view_mode == "dashboard" else "Minimal"
-        det_on = (self.view_mode == "dashboard" and self.show_details and self.size.width >= 100)
+        prof = getattr(self, "_layout_profile", "wide")
+        det_on = (self.view_mode == "dashboard" and self.show_details and (self.size.width >= 100 or prof == "stack"))
         det = "ON" if det_on else "OFF"
 
         flags = []
@@ -847,22 +916,39 @@ class ArgusApp(App):
             flags.append("[#58a6ff]MAINT[/#58a6ff]")
         flags_txt = " ".join(flags) if flags else "[dim]none[/dim]"
 
-        # Riga 1: comandi (puliti + keycaps)
-        line1 = (
-            f"{cap('S', OK_BG)}[dim] Start[/dim]  "
-            f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
-            f"{cap('D')}[dim] Details[/dim]  "
-            f"{cap('V')}[dim] View[/dim]  "
-            f"{cap('T')}[dim] Trust[/dim]  "
-            f"{cap('K')}[dim] Clear[/dim]  "
-            f"{cap('M')}[dim] Maint[/dim]  "
-            f"{cap('U')}[dim] Mute[/dim]  "
-            f"{cap('Enter', OK_BG)}[dim] Report[/dim]  "
-            f"{cap('Esc')}[dim] Back[/dim]  "
-            f"{cap('Q', DANGER_BG)}[dim] Quit[/dim]"
-        )
+        w = self.size.width
 
-        # Riga 2: stato (molto leggibile)
+        if w >= 118:
+            line1 = (
+                f"{cap('S', OK_BG)}[dim] Start[/dim]  "
+                f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
+                f"{cap('D')}[dim] Details[/dim]  "
+                f"{cap('V')}[dim] View[/dim]  "
+                f"{cap('T')}[dim] Trust[/dim]  "
+                f"{cap('K')}[dim] Clear[/dim]  "
+                f"{cap('M')}[dim] Maint[/dim]  "
+                f"{cap('U')}[dim] Mute[/dim]  "
+                f"{cap('Enter', OK_BG)}[dim] Report[/dim]  "
+                f"{cap('Esc')}[dim] Back[/dim]  "
+                f"{cap('Q', DANGER_BG)}[dim] Quit[/dim]"
+            )
+        elif w >= 92:
+            line1 = (
+                f"{cap('S', OK_BG)}[dim] Start[/dim]  "
+                f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
+                f"{cap('V')}[dim] View[/dim]  "
+                f"{cap('D')}[dim] Details[/dim]  "
+                f"{cap('Enter', OK_BG)}[dim] Report[/dim]  "
+                f"{cap('Q', DANGER_BG)}[dim] Quit[/dim]"
+            )
+        else:
+            line1 = (
+                f"{cap('S', OK_BG)}[dim] Start[/dim]  "
+                f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
+                f"{cap('Enter', OK_BG)}[dim] Report[/dim]  "
+                f"{cap('Q', DANGER_BG)}[dim] Quit[/dim]"
+            )
+
         line2 = (
             f"[bold]STATE[/bold] [{state_col}]{state}[/{state_col}]  {DIM} "
             f"[bold]VIEW[/bold] {view}  {DIM} "
