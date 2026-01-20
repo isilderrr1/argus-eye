@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -8,56 +9,186 @@ from typing import Any, Dict, List, Tuple
 from argus import paths
 
 
+def _evidence_for_event(code: str, entity: str, msg: str) -> List[str]:
+    """
+    Best-effort evidence extraction from our own message/entity.
+    Keep it short (max 3-5 lines).
+    """
+    out: List[str] = []
+    c = (code or "").upper()
+    m = msg or ""
+    ent = entity or ""
+
+    # ---------------- HEALTH ----------------
+    if c in ("HEA-01", "HEA-02"):
+        mm = re.search(r"(\d{2,3})\s*°C", m)
+        if mm:
+            out.append(f"Observed CPU temp: {mm.group(1)}°C")
+        if ent:
+            out.append(f"Sensor/entity: {ent}")
+        out.append("Source: sysfs (/sys/class/thermal) or available provider")
+        return out[:5]
+
+    if c == "HEA-03":
+        if ent:
+            out.append(f"Mount: {ent}")
+        mm = re.search(r"(\d{1,3})\s*%", m)
+        if mm:
+            out.append(f"Used: {mm.group(1)}%")
+        out.append("Source: statvfs (filesystem stats)")
+        return out[:5]
+
+    # ---------------- SECURITY ----------------
+    if c == "SEC-01":
+        ipm = re.search(r"\b(?:da|from)\s+([0-9a-fA-F\.:]+)\b", m)
+        if ipm:
+            out.append(f"Source IP: {ipm.group(1)}")
+        nm = re.search(r"\b(\d+)\s+(?:tentativi|attempts)\b", m, re.IGNORECASE)
+        if nm:
+            out.append(f"Failed attempts: {nm.group(1)}")
+        out.append("Source: journald (sshd/auth)")
+        return out[:5]
+
+    if c == "SEC-02":
+        um = re.search(r"\buser=([^\s\)]+)", m)
+        if um:
+            out.append(f"User: {um.group(1)}")
+        ipm = re.search(r"\b(?:da|from)\s+([0-9a-fA-F\.:]+)\b", m)
+        if ipm:
+            out.append(f"Source IP: {ipm.group(1)}")
+        nm = re.search(r"\b(?:dopo|after)\s+(\d+)\s+(?:tentativi|attempts)\b", m, re.IGNORECASE)
+        if nm:
+            out.append(f"Prior failures: {nm.group(1)}")
+        out.append("Source: journald (sshd/auth)")
+        return out[:5]
+
+    if c == "SEC-03":
+        if ent:
+            out.append(f"User: {ent}")
+        cm = re.search(r"Sudo command:\s*([^\(]+)", m)
+        if cm:
+            out.append(f"Command: {cm.group(1).strip()}")
+        tm = re.search(r"\btty=([^\s\)]+)", m)
+        if tm:
+            out.append(f"TTY: {tm.group(1)}")
+        rm = re.search(r"\brunas=([^\s\),]+)", m)
+        if rm:
+            out.append(f"Run-as: {rm.group(1)}")
+        out.append("Source: journald (sudo)")
+        return out[:5]
+
+    if c == "SEC-04":
+        pm = re.search(r":\s*([^\s]+)\s+(?:su|on)\s+([^:\s]+):(\d+)/(\w+)", m, re.IGNORECASE)
+        if pm:
+            out.append(f"Process: {pm.group(1)}")
+            out.append(f"Listener: {pm.group(2)}:{pm.group(3)}/{pm.group(4)}")
+        bm = re.search(r"\[(LOCAL|LAN|GLOBAL)\]", m, re.IGNORECASE)
+        if bm:
+            out.append(f"Bind scope: {bm.group(1).upper()}")
+        sm = re.search(r"\bservice=([^\)]+)\)", m)
+        if sm:
+            out.append(f"Service hint: {sm.group(1)}")
+        out.append("Source: listener scan (ss/netstat equivalent)")
+        return out[:5]
+
+    if c == "SEC-05":
+        pm = re.search(r"(?:modificato|changed):\s*([^\s]+)", m, re.IGNORECASE)
+        if pm:
+            out.append(f"Path: {pm.group(1)}")
+        hm = re.search(r"\bold=([0-9a-f]{8,})\b.*\bnew=([0-9a-f]{8,})\b", m, re.IGNORECASE)
+        if hm:
+            out.append(f"SHA256 old: {hm.group(1)}")
+            out.append(f"SHA256 new: {hm.group(2)}")
+        out.append("Source: integrity watcher (sha256 + debounce)")
+        return out[:5]
+
+    return out[:5]
+
+
+def _why_for_event(code: str, msg: str) -> str:
+    code = (code or "").upper()
+
+    # HEALTH
+    if code == "HEA-01":
+        return "CPU temperature stayed ≥85°C for ≥30s (clears when ≤80°C for ≥60s)."
+    if code == "HEA-02":
+        return "CPU temperature stayed ≥95°C for ≥10s (clears when ≤90°C for ≥60s)."
+    if code == "HEA-03":
+        return "Disk usage exceeded the threshold for 2 consecutive checks (85% WARNING / 95% CRITICAL)."
+
+    # SECURITY
+    if code == "SEC-01":
+        return (
+            "Repeated SSH authentication failures from the same source within a short time window "
+            "(LAN may be downgraded; localhost is INFO)."
+        )
+    if code == "SEC-02":
+        return "Successful login correlated to previous SSH failures from the same IP within 10 minutes."
+    if code == "SEC-03":
+        return "Unusual sudo usage (first-seen user+command window) with escalation rules for suspicious context."
+    if code == "SEC-04":
+        return (
+            "A new listening service was detected (first-seen window); severity depends on bind scope "
+            "and sensitive ports."
+        )
+    if code == "SEC-05":
+        return "Integrity change detected on a critical config/auth file (hash changed with debounce)."
+
+    return "(rule details coming soon)"
+
+
 ADVICE: Dict[str, List[str]] = {
+    # SECURITY
     "SEC-01": [
-        "Se non sei tu: cambia password e disabilita SSH se non serve.",
-        "Blocca l’IP (ufw/nftables) e verifica utenti/chiavi SSH.",
-        "Controlla report/log per capire username provati e frequenza.",
+        "If it wasn't you: change passwords / rotate SSH keys, and disable SSH if not needed.",
+        "Block the source IP (ufw/nftables) and review SSH exposure (port, allowlist).",
+        "Inspect auth logs to see targeted usernames and frequency.",
     ],
     "SEC-02": [
-        "Verifica se l’accesso era tuo (IP, orario, user).",
-        "Se sospetto: cambia password e chiudi le sessioni attive.",
-        "Controlla comandi recenti e attività sudo (SEC-03).",
+        "Confirm the login was yours (IP, time, user).",
+        "If suspicious: change password / revoke keys and terminate active sessions.",
+        "Review follow-up activity and sudo usage (SEC-03).",
     ],
     "SEC-03": [
-        "Se non sei tu: cambia password e verifica account/local users.",
-        "Controlla cosa ha fatto quel comando e cosa è cambiato nel sistema.",
-        "Se high-risk: verifica /etc/passwd, sudoers, cron, systemctl, ecc.",
+        "If it wasn't you: change password and review local users/accounts.",
+        "Check what the sudo command did and what changed on the system.",
+        "If high-risk: audit /etc/passwd, sudoers, cron, systemctl changes.",
     ],
     "SEC-04": [
-        "Verifica se il servizio è voluto (programma e porta).",
-        "Se non serve: chiudi porta o disabilita il servizio.",
-        "Se è voluto: premi T per Trust (allowlist) e riduci rumore.",
+        "Confirm the service is expected (process + port + bind scope).",
+        "If not expected: close the port or disable the service immediately.",
+        "If expected: add to Trust (allowlist) to reduce noise.",
     ],
     "SEC-05": [
-        "Se non sei tu: verifica subito cosa è cambiato nel file.",
-        "Controlla aggiornamenti/maintenance e attività sudo correlate (SEC-03).",
-        "Ripristina configurazione sicura e ruota credenziali se necessario.",
+        "Verify what changed and whether it matches planned maintenance/updates.",
+        "If suspicious: restore secure config and rotate credentials if needed.",
+        "Correlate with login/sudo activity (SEC-02 / SEC-03).",
     ],
+    # HEALTH
     "HEA-01": [
-        "Riduci carichi e controlla ventole/dissipatore.",
-        "Verifica curve ventole e pasta termica.",
-        "Se persiste: indaga processi e airflow del case.",
+        "Reduce CPU load and verify airflow/fans are working.",
+        "Check cooling (dust / thermal paste / fan curves / pump if AIO).",
+        "If recurring: investigate background processes and sustained temps.",
     ],
     "HEA-02": [
-        "Chiudi carichi subito; verifica dissipazione.",
-        "Se non scende: spegni per evitare danni.",
-        "Controlla pompa/ventole/sensori e carichi anomali.",
+        "Stop heavy workloads immediately and confirm temperature drops.",
+        "Check cooling hardware (fan/pump) and ensure proper contact/airflow.",
+        "If it stays critical: shut down to prevent damage.",
     ],
     "HEA-03": [
-        "Libera spazio (cache, download, log).",
-        "Trova i top file/dir che occupano di più.",
-        "Assicurati che aggiornamenti non siano bloccati.",
+        "Free up disk space to avoid failures (updates, logs, services).",
+        "Find the biggest directories/files (du / ncdu) and remove what’s not needed.",
+        "If unexpected growth: investigate logs, runaway processes, snapshots.",
     ],
     "HEA-04": [
-        "Controlla lo stato della unit e gli ultimi errori.",
-        "Verifica config e dipendenze del servizio.",
-        "Se critico: disabilita temporaneamente per stabilizzare.",
+        "Check the unit/service status and recent errors.",
+        "Verify configuration and dependencies.",
+        "If critical: temporarily disable to stabilize the system.",
     ],
     "HEA-05": [
-        "Salva lavoro subito: possibili errori disco/FS.",
-        "Controlla SMART e log kernel/journal.",
-        "Esegui fsck (se applicabile) e pianifica backup.",
+        "Save work immediately: possible disk/filesystem errors.",
+        "Check SMART and kernel/journal logs.",
+        "Run fsck if applicable and plan backups.",
     ],
 }
 
@@ -82,16 +213,22 @@ def _safe(s: str) -> str:
 
 def render_markdown(event: Dict[str, Any]) -> str:
     ts = datetime.fromtimestamp(int(event["ts"])).strftime("%Y-%m-%d %H:%M:%S")
-    code = str(event.get("code") or "")
+    code = str(event.get("code") or "").upper()
     sev = str(event.get("severity") or "INFO").upper()
     ent = str(event.get("entity") or "")
     msg = str(event.get("message") or "").strip()
 
     actions = ADVICE.get(code, [])
     if not actions:
-        actions = ["(azioni consigliate: in arrivo)", "(azioni consigliate: in arrivo)", "(azioni consigliate: in arrivo)"]
-    else:
-        actions = (actions + ["(n/a)", "(n/a)", "(n/a)"])[:3]
+        actions = [
+            "Confirm whether this was expected.",
+            "If unexpected: inspect logs around the timestamp.",
+            "Apply mitigation steps appropriate for this event type.",
+        ]
+    actions = (actions + ["(n/a)", "(n/a)", "(n/a)"])[:3]
+
+    why = _why_for_event(code, msg)
+    evidence = _evidence_for_event(code, ent, msg)
 
     lines: List[str] = []
     lines.append(f"# ARGUS Report — {code} ({sev})")
@@ -100,32 +237,39 @@ def render_markdown(event: Dict[str, Any]) -> str:
     if ent:
         lines.append(f"- Entity: {ent}")
     lines.append("")
-    lines.append("## Cosa è successo")
+    lines.append("## What happened")
     lines.append(msg if msg else "(n/a)")
     lines.append("")
-    lines.append("## Cosa fare ora")
+    lines.append("## Why this triggered")
+    lines.append(why)
+    lines.append("")
+    lines.append("## What to do now")
     lines.append(f"1) {actions[0]}")
     lines.append(f"2) {actions[1]}")
     lines.append(f"3) {actions[2]}")
     lines.append("")
-    lines.append("## Dettagli")
+    lines.append("## Details")
     lines.append(f"- event_id: {event.get('id')}")
     lines.append(f"- code: {code}")
     lines.append(f"- severity: {sev}")
     lines.append("")
-    lines.append("## Evidenze")
-    lines.append("- (max 5 righe: in v1 le aggiungiamo quando centralizziamo collectors/engine)")
+    lines.append("## Evidence")
+    if evidence:
+        for ev in evidence[:5]:
+            lines.append(f"- {ev}")
+    else:
+        lines.append("- (no evidence available)")
     lines.append("")
     return "\n".join(lines)
 
 
 def write_report(event: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Crea report MD + JSON. Ritorna (md_path, json_path).
+    Create MD + JSON report. Returns (md_path, json_path).
     """
     rep_dir = _reports_dir()
     ts = datetime.fromtimestamp(int(event["ts"])).strftime("%Y-%m-%d_%H%M%S")
-    code = _safe(str(event.get("code") or "EVT"))
+    code = _safe(str(event.get("code") or "EVT").upper())
     eid = int(event.get("id") or 0)
 
     md_path = rep_dir / f"report_{ts}_{code}_{eid}.md"
@@ -134,16 +278,21 @@ def write_report(event: Dict[str, Any]) -> Tuple[str, str]:
     md = render_markdown(event)
     md_path.write_text(md, encoding="utf-8")
 
+    msg = str(event.get("message") or "")
+    ent = str(event.get("entity") or "")
     payload = {
+        "report_version": 2,
         "id": eid,
         "ts": int(event["ts"]),
-        "code": str(event.get("code") or ""),
-        "severity": str(event.get("severity") or ""),
-        "message": str(event.get("message") or ""),
-        "entity": str(event.get("entity") or ""),
+        "code": str(event.get("code") or "").upper(),
+        "severity": str(event.get("severity") or "").upper(),
+        "message": msg,
+        "entity": ent,
         "details_json": str(event.get("details_json") or ""),
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "actions": ADVICE.get(str(event.get("code") or ""), []),
+        "why": _why_for_event(str(event.get("code") or ""), msg),
+        "evidence": _evidence_for_event(str(event.get("code") or ""), ent, msg),
+        "actions": ADVICE.get(str(event.get("code") or "").upper(), []),
     }
     js_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
