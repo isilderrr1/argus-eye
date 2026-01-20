@@ -72,6 +72,23 @@ ADVICE: Dict[str, List[str]] = {
         "Check maintenance/updates and related sudo activity (SEC-03).",
         "Restore secure config and rotate credentials if needed.",
     ],
+
+        "HEA-01": [
+        "Close heavy workloads (browser tabs, builds, VMs) and watch the temperature trend.",
+        "Check airflow and fans (dust, case airflow, laptop vents).",
+        "If it repeats: verify thermal paste / cooling profile / power limits.",
+    ],
+    "HEA-02": [
+        "Immediately stop heavy loads. If it doesn't drop within 60s, shut down to avoid damage.",
+        "Check cooler/pump/fans and ensure the CPU heatsink is properly seated.",
+        "Review recent changes: BIOS settings, turbo boost, fan curve, background tasks.",
+    ],
+    "HEA-03": [
+        "Free space on the affected mount (logs, downloads, cache).",
+        "Find what's large: du -xh --max-depth=1 <mount> | sort -h",
+        "If unexpected: check recent writes and consider moving data to another disk.",
+    ],
+
 }
 
 
@@ -142,6 +159,46 @@ def _fmt_header(state: str, threat: int, health: int, temp: str, disk: str, run:
         f"👁 ARGUS | {state} | Threat {threat}/100 | Health {health}/100 | "
         f"🌡 {temp} | 💽 {disk} | 🔔 CRIT | {run}{mm_txt}"
     )
+
+def _why_for_event(code: str, msg: str) -> str:
+    code = (code or "").upper()
+    if code == "HEA-01":
+        return "CPU temperature stayed ≥85°C for ≥30s (clears when ≤80°C for ≥60s)."
+    if code == "HEA-02":
+        return "CPU temperature stayed ≥95°C for ≥10s (clears when ≤90°C for ≥60s)."
+    if code == "HEA-03":
+        return "Disk usage exceeded the threshold for 2 consecutive checks (85% WARNING / 95% CRITICAL)."
+    return "(rule details coming soon)"
+
+
+def _evidence_for_event(code: str, entity: str, msg: str) -> List[str]:
+    """
+    Best-effort evidence extraction from our own message/entity.
+    Keep it short (max 3-5 lines).
+    """
+    out: List[str] = []
+    c = (code or "").upper()
+
+    if c in ("HEA-01", "HEA-02"):
+        # try to extract "95°C" from message
+        m = re.search(r"(\d{2,3})\s*°C", msg)
+        if m:
+            out.append(f"Observed CPU temp: {m.group(1)}°C")
+        if entity:
+            out.append(f"Sensor/entity: {entity}")
+        out.append("Source: sysfs (/sys/class/thermal) or available provider")
+        return out[:5]
+
+    if c == "HEA-03":
+        if entity:
+            out.append(f"Mount: {entity}")
+        m = re.search(r"at\s+(\d{1,3})%", msg)
+        if m:
+            out.append(f"Used: {m.group(1)}%")
+        out.append("Source: statvfs (/proc/mounts + filesystem stats)")
+        return out[:5]
+
+    return out[:5]
 
 
 def _parse_sec03_key(key: str) -> tuple[str, str]:
@@ -834,6 +891,7 @@ class ArgusApp(App):
             self._selected = Selected(event=item.event)
             self._update_detail()
 
+
     def _update_detail(self) -> None:
         if self.ui_mode != "main":
             return
@@ -856,6 +914,10 @@ class ArgusApp(App):
         ent = (e.get("entity") or "")
         msg = (e.get("message") or "").strip()
 
+        why = _why_for_event(code, msg)
+        evid = _evidence_for_event(code, ent, msg)
+        evid_txt = "\n".join([f"  • {x}" for x in evid]) if evid else "  • (no evidence captured)"
+
         advice = ADVICE.get(code, [])
         advice_txt = "\n".join([f"  • {a}" for a in advice]) if advice else "  • (actions coming soon)"
         has_report = "YES" if (e.get("report_md_path") or "").strip() else "NO"
@@ -869,8 +931,14 @@ class ArgusApp(App):
                     "What happened",
                     f"  {msg}",
                     "",
+                    "Why it triggered",
+                    f"  {why}",
+                    "",
                     "Entity",
                     f"  {ent if ent else '(n/a)'}",
+                    "",
+                    "Evidence",
+                    f"{evid_txt}",
                     "",
                     "What to do now",
                     f"{advice_txt}",
@@ -879,6 +947,7 @@ class ArgusApp(App):
                 ]
             )
         )
+
 
     def _update_footerbar(self) -> None:
         if self.ui_mode != "main":
@@ -984,12 +1053,21 @@ class ArgusApp(App):
         threat = _score(last_10m, "SEC-")
         health = _score(last_10m, "HEA-")
 
+        # --- Health header signals ---
         temp = format_cpu_temp()
+
         disk = "--%"
+        try:
+            from argus.collectors.disk import root_used_pct
+            pct = root_used_pct()
+            disk = f"{pct}%" if pct is not None else "--%"
+        except Exception:
+            disk = "--%"
 
         run = _status_runstop()
         hdr.update(_fmt_header(state, threat, health, temp, disk, run))
 
+        # --- Overlay: active CRITICAL ---
         crit_now = [e for e in last_10m if (e.get("severity") or "").upper() == "CRITICAL"]
         crit_now = sorted(crit_now, key=lambda x: int(x["ts"]), reverse=True)[:3]
         if crit_now:
@@ -1000,6 +1078,7 @@ class ArgusApp(App):
         else:
             overlay.update("")
 
+        # --- Summary (dashboard only) ---
         if self.view_mode == "dashboard":
             counts_today: Dict[str, int] = {}
             for e in visible:
@@ -1028,11 +1107,11 @@ class ArgusApp(App):
                 out.append("  (no new entries today)")
             else:
                 for row in sec03_today:
-                    t = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
+                    tt = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
                     user, cmd = _parse_sec03_key(row.get("key", ""))
                     cnt = int(row.get("count", 1))
                     cmd_s = cmd if len(cmd) <= 70 else cmd[:67] + "..."
-                    out.append(f"  {t}  🧨  {user}  {cmd_s}  (x{cnt})")
+                    out.append(f"  {tt}  🧨  {user}  {cmd_s}  (x{cnt})")
 
             out.append("")
             out.append("SEC-04 — New listening services seen today (first-seen)")
@@ -1040,7 +1119,7 @@ class ArgusApp(App):
                 out.append("  (no new entries today)")
             else:
                 for row in sec04_today:
-                    t = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
+                    tt = datetime.fromtimestamp(int(row["first_ts"])).strftime("%H:%M:%S")
                     key = row.get("key", "")
                     parts = key.split("|")
                     proc = parts[1] if len(parts) > 1 else "?"
@@ -1048,12 +1127,13 @@ class ArgusApp(App):
                     proto = parts[3] if len(parts) > 3 else "?"
                     bind = parts[4] if len(parts) > 4 else "?"
                     cnt = int(row.get("count", 1))
-                    out.append(f"  {t}  👂🌐  {proc}  {proto}/{port}  [{bind}] (x{cnt})")
+                    out.append(f"  {tt}  👂🌐  {proc}  {proto}/{port}  [{bind}] (x{cnt})")
 
             summary.update("\n".join(out))
         else:
             summary.update("")
 
+        # --- Feed update ---
         if feed_sig != self._last_feed_sig:
             self._last_feed_sig = feed_sig
             old_index = lv.index

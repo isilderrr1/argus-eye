@@ -21,3 +21,7 @@ token.txt
 
 # Local backups
 *.bak*
+
+# local backups
+*.bak_*
+src/argus/tui.py.bak_*
