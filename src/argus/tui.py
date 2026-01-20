@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.widgets import Static, ListView, ListItem, Label
 
@@ -147,6 +147,49 @@ def _parse_sec03_key(key: str) -> tuple[str, str]:
     return user, cmd
 
 
+def _splash_text() -> str:
+    # Rich markup (Textual)
+    return "\n".join(
+        [
+            "[bold green]┌──────────────────────────────────────────────────────────────────────┐[/bold green]",
+            "[bold green]│  █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗                          │[/bold green]",
+            "[bold green]│ ██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝                          │[/bold green]",
+            "[bold green]│ ███████║██████╔╝██║  ███╗██║   ██║███████╗                          │[/bold green]",
+            "[bold green]│ ██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║                          │[/bold green]",
+            "[bold green]│ ██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║                          │[/bold green]",
+            "[bold green]│ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝                          │[/bold green]",
+            "[bold green]└──────────────────────────────────────────────────────────────────────┘[/bold green]",
+            "",
+            "[green]        .-''''-.                       [/green]",
+            "[green]     .-'  _  _  '-.                    [/green]",
+            "[green]    /    (o)(o)    \\                   [/green]",
+            "[green]   |      .--.      |   [bold]Argus watches. You decide.[/bold][/green]",
+            "[green]    \\    (____)    /                    [/green]",
+            "[green]     '-.        .-'                     [/green]",
+            "[green]        '-.__.-'                        [/green]",
+            "",
+            "[bold]What is ARGUS?[/bold]",
+            "ARGUS is a lightweight Linux monitor for home desktops.",
+            "It watches [bold]security[/bold] and [bold]system health[/bold] and keeps noise low:",
+            "  • Popups only for [bold red]CRITICAL[/bold red] events",
+            "  • Everything else goes to the feed + reports",
+            "",
+            "[bold]Security modules[/bold] (v1):",
+            "  • SSH brute force (SEC-01) / success-after-fail (SEC-02)",
+            "  • Unusual sudo (SEC-03) / new listening ports (SEC-04) / file integrity (SEC-05)",
+            "",
+            "[bold]Reports[/bold]:",
+            "  • Markdown + JSON are saved under [dim]~/.local/share/argus/reports/[/dim]",
+            "",
+            "[bold]Quick keys[/bold]:",
+            "  [bold]Enter[/bold] Continue to Dashboard",
+            "  [bold]S[/bold] Start   [bold]X[/bold] Stop   [bold]M[/bold] Maintenance 30m   [bold]U[/bold] Mute 10m   [bold]Q[/bold] Quit",
+            "",
+            "[dim]Tip: if you can't read /var/log/auth.log on Ubuntu, add yourself to group 'adm' and relogin.[/dim]",
+        ]
+    )
+
+
 @dataclass
 class Selected:
     event: dict
@@ -162,6 +205,10 @@ class ArgusApp(App):
     CSS = """
     Screen { padding: 1 2; }
 
+    #splash { height: 1fr; border: round $surface; }
+    #splash_text { padding: 1 2; }
+
+    #app { height: 1fr; }
     #hdr { height: 3; }
     #overlay { height: auto; }
     #summary { height: auto; padding: 1 0; }
@@ -176,13 +223,14 @@ class ArgusApp(App):
     .hidden { display: none; }
     """
 
+    ui_mode = reactive("splash")        # splash|main
     view_mode = reactive("dashboard")   # dashboard|minimal
     show_details = reactive(True)
 
     _selected: Optional[Selected] = None
     _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
 
-    # Quando apri un report con Enter, lo "blocchiamo" qui per non farlo sovrascrivere dal refresh.
+    # Report override: quando apri un report con Enter, lo blocchiamo qui per non farlo sovrascrivere dal refresh.
     _detail_override_text: Optional[str] = None
     _detail_override_event_id: Optional[int] = None
 
@@ -195,34 +243,63 @@ class ArgusApp(App):
         ("k", "clear_events", "Pulisci"),
         ("m", "maintenance_30", "Maint 30m"),
         ("u", "mute_10", "Mute 10m"),
-        ("enter", "open_selected", "Apri"),
-        ("escape", "close_report", "Indietro"),
+        ("enter", "open_selected", "Continue/Open"),
+        ("escape", "close_report", "Back"),
         ("q", "quit", "Quit"),
         ("up", "cursor_up", ""),
         ("down", "cursor_down", ""),
     ]
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="hdr")
-        yield Static("", id="overlay")
-        yield Static("", id="summary")
-        with Horizontal(id="main"):
-            yield ListView(id="feed")
-            with VerticalScroll(id="detail_box"):
-                yield Static("", id="detail_text")
-        yield Static("", id="footerbar")
+        with VerticalScroll(id="splash"):
+            yield Static(_splash_text(), id="splash_text")
+
+        with Container(id="app"):
+            yield Static("", id="hdr")
+            yield Static("", id="overlay")
+            yield Static("", id="summary")
+            with Horizontal(id="main"):
+                yield ListView(id="feed")
+                with VerticalScroll(id="detail_box"):
+                    yield Static("", id="detail_text")
+            yield Static("", id="footerbar")
 
     def on_mount(self) -> None:
         db.init_db()
         self.set_interval(1.0, self._refresh)
+        self._apply_global_visibility()
+        self._refresh()
+
+    # ----- splash/global visibility -----
+    def action_continue(self) -> None:
+        self.ui_mode = "main"
+        self._apply_global_visibility()
         self._refresh()
         self.query_one("#feed", ListView).focus()
 
+    def _apply_global_visibility(self) -> None:
+        splash = self.query_one("#splash", VerticalScroll)
+        app = self.query_one("#app", Container)
+
+        if self.ui_mode == "splash":
+            splash.remove_class("hidden")
+            app.add_class("hidden")
+            return
+
+        splash.add_class("hidden")
+        app.remove_class("hidden")
+        self._apply_visibility()
+
+    # ----- view modes -----
     def action_toggle_view(self) -> None:
+        if self.ui_mode != "main":
+            return
         self.view_mode = "minimal" if self.view_mode == "dashboard" else "dashboard"
         self._apply_visibility()
 
     def action_toggle_details(self) -> None:
+        if self.ui_mode != "main":
+            return
         self.show_details = not self.show_details
         self._apply_visibility()
 
@@ -241,6 +318,7 @@ class ArgusApp(App):
         else:
             detail_box.add_class("hidden")
 
+    # ----- actions -----
     def action_close_report(self) -> None:
         """Esc: esce dalla vista report e torna ai dettagli evento."""
         if self._detail_override_text is None:
@@ -282,6 +360,9 @@ class ArgusApp(App):
         self._refresh()
 
     def action_clear_events(self) -> None:
+        if self.ui_mode != "main":
+            return
+
         lv = self.query_one("#feed", ListView)
         overlay = self.query_one("#overlay", Static)
         summary = self.query_one("#summary", Static)
@@ -305,6 +386,8 @@ class ArgusApp(App):
         self._refresh()
 
     def action_cursor_up(self) -> None:
+        if self.ui_mode != "main":
+            return
         lv = self.query_one("#feed", ListView)
         if not lv.children:
             lv.index = None
@@ -315,6 +398,8 @@ class ArgusApp(App):
             lv.index = max(0, lv.index - 1)
 
     def action_cursor_down(self) -> None:
+        if self.ui_mode != "main":
+            return
         lv = self.query_one("#feed", ListView)
         if not lv.children:
             lv.index = None
@@ -325,6 +410,11 @@ class ArgusApp(App):
             lv.index = min(len(lv.children) - 1, lv.index + 1)
 
     def action_open_selected(self) -> None:
+        # In splash: Enter = continue
+        if self.ui_mode != "main":
+            self.action_continue()
+            return
+
         detail_text = self.query_one("#detail_text", Static)
         if not self._selected:
             return
@@ -348,12 +438,14 @@ class ArgusApp(App):
         except Exception as ex:
             txt = f"Errore lettura report: {ex!r}\nPath: {md_path}"
 
-        # Override: resta visibile anche con refresh ogni 1s
         self._detail_override_text = txt
         self._detail_override_event_id = eid
         detail_text.update(txt)
 
     def action_trust_selected(self) -> None:
+        if self.ui_mode != "main":
+            return
+
         if not self._selected:
             db.add_event(code="SYS", severity="INFO", message="Trust: seleziona prima un evento.", entity="tui")
             self._refresh()
@@ -382,11 +474,14 @@ class ArgusApp(App):
         db.add_event(code="SYS", severity="INFO", message=f"Trust SEC-04: {out}", entity="tui")
         self._refresh()
 
+    # ----- listview highlight -----
     def on_list_view_highlighted(self, message: ListView.Highlighted) -> None:
+        if self.ui_mode != "main":
+            return
+
         item = message.item
         if isinstance(item, EventRow):
             new_id = int(item.event.get("id") or 0)
-            # Se cambi selezione, esci dalla vista report
             if self._detail_override_event_id is not None and self._detail_override_event_id != new_id:
                 self._detail_override_text = None
                 self._detail_override_event_id = None
@@ -394,7 +489,11 @@ class ArgusApp(App):
             self._selected = Selected(event=item.event)
             self._update_detail()
 
+    # ----- detail panel -----
     def _update_detail(self) -> None:
+        if self.ui_mode != "main":
+            return
+
         detail_text = self.query_one("#detail_text", Static)
         if not self._selected:
             detail_text.update("")
@@ -403,7 +502,6 @@ class ArgusApp(App):
         e = self._selected.event
         eid = int(e.get("id") or 0)
 
-        # Se stiamo mostrando il report per questo evento, non sovrascrivere.
         if self._detail_override_text is not None and self._detail_override_event_id == eid:
             detail_text.update(self._detail_override_text)
             return
@@ -433,12 +531,16 @@ class ArgusApp(App):
                     "Cosa fare ora",
                     f"{advice_txt}",
                     "",
-                    f"Report associato: {has_report}  (premi Enter per aprire, Esc per tornare)",
+                    f"Report associato: {has_report}  (Enter apre, Esc torna indietro)",
                 ]
             )
         )
 
+    # ----- footer -----
     def _update_footerbar(self) -> None:
+        if self.ui_mode != "main":
+            return
+
         footer = self.query_one("#footerbar", Static)
         view = "Dash" if self.view_mode == "dashboard" else "Min"
         det = "Det ON" if (self.view_mode == "dashboard" and self.show_details and self.size.width >= 100) else "Det OFF"
@@ -456,8 +558,13 @@ class ArgusApp(App):
             f"    {run} | {view} | {det}{flags_txt}"
         )
 
+    # ----- refresh loop -----
     def _refresh(self) -> None:
         db.init_db()
+
+        # In splash non serve aggiornare UI “main”, ma possiamo lasciare il loop attivo (non rompe).
+        if self.ui_mode != "main":
+            return
 
         hdr = self.query_one("#hdr", Static)
         overlay = self.query_one("#overlay", Static)
