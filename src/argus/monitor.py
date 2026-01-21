@@ -5,10 +5,11 @@ import time
 import typer
 
 from argus import db
+from argus.collectors.authlog import tail_file
 from argus.collectors.temperature import read_cpu_temp_c
 from argus.detectors.hea_disk import DiskUsageDetector
+from argus.detectors.hea_services import HeaServicesDetector
 from argus.detectors.hea_temperature import TemperatureDetector
-from argus.collectors.authlog import tail_file
 from argus.detectors.sec01_ssh import SshBruteForceDetector
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
 from argus.detectors.sec03_sudo import SudoActivityDetector
@@ -19,7 +20,7 @@ from argus.detectors.sec05_file_integrity import FileIntegrityDetector
 def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = ListeningPortDetector()
 
-    # baseline (niente eventi)
+    # baseline (no events)
     det.poll()
 
     while not stop.is_set():
@@ -36,7 +37,7 @@ def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
 def _sec05_loop(stop: threading.Event, interval_s: int = 10) -> None:
     det = FileIntegrityDetector()
 
-    # baseline (niente eventi)
+    # baseline (no events)
     det.poll()
 
     while not stop.is_set():
@@ -49,8 +50,10 @@ def _sec05_loop(stop: threading.Event, interval_s: int = 10) -> None:
 
         stop.wait(interval_s)
 
+
 def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
     det = TemperatureDetector()
+
     while not stop.is_set():
         try:
             t = read_cpu_temp_c()
@@ -63,6 +66,7 @@ def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
 
         stop.wait(interval_s)
 
+
 def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = DiskUsageDetector()
 
@@ -74,7 +78,13 @@ def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
             for item in det.poll():
                 # item can be (sev, entity, msg, details_json)
                 sev, entity, msg, details_json = item
-                db.add_event(code="HEA-03", severity=sev, message=msg, entity=str(entity), details_json=details_json)
+                db.add_event(
+                    code="HEA-03",
+                    severity=sev,
+                    message=msg,
+                    entity=str(entity),
+                    details_json=details_json,
+                )
                 typer.echo(f"[HEA-03] {sev:<8} {entity}  {msg}")
         except Exception as e:
             typer.echo(f"[HEA-03] ERROR    disk-scan failed: {e!r}")
@@ -82,12 +92,57 @@ def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
         stop.wait(interval_s)
 
 
+def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
+    """
+    HEA-04: systemd service health.
+    We call detector frequently, but it will internally rate-limit (debounce/interval).
+    Supports both styles:
+      - det.poll() -> iterable of tuples
+      - det.tick(now_ts) -> emits events internally
+    """
+    det = HeaServicesDetector(interval_s=15)
+
+    # baseline if detector supports it
+    if hasattr(det, "poll"):
+        try:
+            _ = list(det.poll())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    while not stop.is_set():
+        try:
+            if hasattr(det, "poll"):
+                for item in det.poll():  # type: ignore[attr-defined]
+                    # accepted shapes:
+                    #   (sev, entity, msg)
+                    #   (code, sev, entity, msg)
+                    if not item:
+                        continue
+                    if len(item) == 3:
+                        sev, entity, msg = item
+                        code = "HEA-04"
+                    elif len(item) >= 4:
+                        code, sev, entity, msg = item[0], item[1], item[2], item[3]
+                    else:
+                        continue
+
+                    db.add_event(code=str(code), severity=str(sev), message=str(msg), entity=str(entity))
+                    typer.echo(f"[{code}] {str(sev):<8} {entity}  {msg}")
+            else:
+                # tick-style detector (emits to DB inside)
+                now_ts = int(time.time())
+                det.tick(now_ts)  # type: ignore[attr-defined]
+        except Exception as e:
+            typer.echo(f"[HEA-04] ERROR    service-scan failed: {e!r}")
+
+        stop.wait(interval_s)
+
+
 def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     """
-    Monitor foreground:
+    Foreground monitor:
       - tail auth.log -> SEC-01/02/03
-      - thread poll -> SEC-04
-      - thread poll -> SEC-05
+      - background poll threads -> SEC-04, SEC-05, HEA-01/02, HEA-03, HEA-04
     """
     db.init_db()
 
@@ -101,19 +156,22 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         ("SEC-03", det_sec03),
     ]
 
-    typer.echo(f"[argus] Security monitor (auth.log) -> {log_path}")
+    typer.echo(f"[argus] Monitor: auth.log -> {log_path}")
     typer.echo("[argus] Premi CTRL+C per fermare.")
 
     stop = threading.Event()
-    t4 = threading.Thread(target=_sec04_loop, args=(stop,), daemon=True)
-    t5 = threading.Thread(target=_sec05_loop, args=(stop,), daemon=True)
-    t4.start()
-    t5.start()
-    tT = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
-    tT.start()
-    t6 = threading.Thread(target=_hea03_loop, args=(stop,), daemon=True)
-    t6.start()
 
+    t_sec04 = threading.Thread(target=_sec04_loop, args=(stop,), daemon=True)
+    t_sec05 = threading.Thread(target=_sec05_loop, args=(stop,), daemon=True)
+    t_temp  = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
+    t_disk  = threading.Thread(target=_hea03_loop, args=(stop,), daemon=True)
+    t_svc   = threading.Thread(target=_hea04_loop, args=(stop,), daemon=True)
+
+    t_sec04.start()
+    t_sec05.start()
+    t_temp.start()
+    t_disk.start()
+    t_svc.start()
 
     time.sleep(0.2)
 
@@ -143,8 +201,8 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         typer.echo("\n[argus] Stop richiesto dall'utente. (CTRL+C)")
     finally:
         stop.set()
-        t4.join(timeout=2)
-        t5.join(timeout=2)
-        tT.join(timeout=2)
-        t6.join(timeout=2)
-
+        t_sec04.join(timeout=2)
+        t_sec05.join(timeout=2)
+        t_temp.join(timeout=2)
+        t_disk.join(timeout=2)
+        t_svc.join(timeout=2)

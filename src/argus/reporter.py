@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -9,24 +10,137 @@ from typing import Any, Dict, List, Tuple
 from argus import paths
 
 
-def _evidence_for_event(code: str, entity: str, msg: str) -> List[str]:
+# ---------------- Utilities ----------------
+
+def _reports_dir() -> Path:
+    paths.ensure_dirs()
+    if hasattr(paths, "reports_dir"):
+        try:
+            p = Path(paths.reports_dir())  # type: ignore[attr-defined]
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    p = Path.home() / ".local/share/argus/reports"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _safe(s: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in (s or ""))
+
+
+def _load_details(details_json: str) -> Dict[str, Any]:
+    if not details_json:
+        return {}
+    try:
+        d = json.loads(details_json)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _kv_from_msg(msg: str) -> Dict[str, str]:
     """
-    Best-effort evidence extraction from our own message/entity.
-    Keep it short (max 3-5 lines).
+    Parse key=value pairs inside messages like:
+    'Service unhealthy: cron.service (active=inactive, sub=dead, state=enabled, ...)'
     """
+    out: Dict[str, str] = {}
+    for k, v in re.findall(r"\b([a-z_]+)\s*=\s*([^,\)\s]+)", msg or "", flags=re.IGNORECASE):
+        out[k.lower()] = v
+    return out
+
+
+def _journal_tail_unit(unit: str, n: int = 3) -> List[str]:
+    """
+    Best-effort journald tail for a unit.
+    Will return [] if journalctl isn't accessible (permissions, not installed, etc).
+    """
+    unit = (unit or "").strip()
+    if not unit:
+        return []
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", unit, "-b", "--no-pager", "-n", str(n), "-o", "short"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if r.returncode != 0:
+            return []
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        # keep only last n lines
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+# ---------------- Why / Evidence ----------------
+
+def _why_for_event(code: str, msg: str, details_json: str = "") -> str:
+    code_u = (code or "").upper()
+    d = _load_details(details_json)
+    kv = _kv_from_msg(msg or "")
+
+    # HEALTH
+    if code_u == "HEA-01":
+        return "CPU temperature stayed ≥85°C for ≥30s (clears when ≤80°C for ≥60s)."
+    if code_u == "HEA-02":
+        return "CPU temperature stayed ≥95°C for ≥10s (clears when ≤90°C for ≥60s)."
+    if code_u == "HEA-03":
+        return "Disk usage exceeded the threshold for 2 consecutive checks (85% WARNING / 95% CRITICAL)."
+
+    if code_u == "HEA-04":
+        unit_state = str(d.get("unit_file_state") or d.get("state") or kv.get("state") or "unknown").lower()
+        active = str(d.get("active_state") or kv.get("active") or "unknown").lower()
+        sub = str(d.get("sub_state") or kv.get("sub") or "unknown").lower()
+        result = str(d.get("result") or kv.get("result") or "unknown").lower()
+
+        return (
+            "A tracked systemd service was detected as unhealthy. "
+            f"Expected-to-run state was derived from systemd (enabled/state='{unit_state}'). "
+            f"Runtime status was active='{active}', sub='{sub}', result='{result}'. "
+            "ARGUS triggers when a monitored unit is enabled but not running/healthy, "
+            "or when systemd reports a failure state."
+        )
+
+    # SECURITY
+    if code_u == "SEC-01":
+        return (
+            "Repeated SSH authentication failures from the same source within a short time window "
+            "(LAN may be downgraded; localhost is INFO)."
+        )
+    if code_u == "SEC-02":
+        return "Successful login correlated to previous SSH failures from the same IP within 10 minutes."
+    if code_u == "SEC-03":
+        return "Unusual sudo usage (first-seen user+command window) with escalation rules for suspicious context."
+    if code_u == "SEC-04":
+        return (
+            "A new listening service was detected (first-seen window); severity depends on bind scope "
+            "and sensitive ports."
+        )
+    if code_u == "SEC-05":
+        return "Integrity change detected on a critical config/auth file (hash changed with debounce)."
+
+    return "(rule details coming soon)"
+
+
+def _evidence_for_event(code: str, entity: str, msg: str, details_json: str = "") -> List[str]:
     out: List[str] = []
     c = (code or "").upper()
     m = msg or ""
     ent = entity or ""
+    d = _load_details(details_json)
+    kv = _kv_from_msg(m)
 
-    # ---------------- HEALTH ----------------
+    # HEALTH
     if c in ("HEA-01", "HEA-02"):
         mm = re.search(r"(\d{2,3})\s*°C", m)
         if mm:
             out.append(f"Observed CPU temp: {mm.group(1)}°C")
         if ent:
             out.append(f"Sensor/entity: {ent}")
-        out.append("Source: sysfs (/sys/class/thermal) or available provider")
+        out.append("Source: thermal provider (sysfs /sys/class/thermal when available)")
         return out[:5]
 
     if c == "HEA-03":
@@ -35,10 +149,37 @@ def _evidence_for_event(code: str, entity: str, msg: str) -> List[str]:
         mm = re.search(r"(\d{1,3})\s*%", m)
         if mm:
             out.append(f"Used: {mm.group(1)}%")
-        out.append("Source: statvfs (filesystem stats)")
+        out.append("Source: filesystem stats (statvfs)")
         return out[:5]
 
-    # ---------------- SECURITY ----------------
+    if c == "HEA-04":
+        unit = (d.get("unit") or d.get("name") or ent or "").strip() or "(unknown unit)"
+        active = str(d.get("active_state") or kv.get("active") or "unknown")
+        sub = str(d.get("sub_state") or kv.get("sub") or "unknown")
+        enabled = str(d.get("unit_file_state") or d.get("state") or kv.get("state") or "unknown")
+        result = str(d.get("result") or kv.get("result") or "unknown")
+        status = str(d.get("status") or d.get("exit_status") or kv.get("status") or "unknown")
+        restarts = str(d.get("restarts") or d.get("n_restarts") or kv.get("restarts") or "unknown")
+
+        out.append(f"Unit: {unit}")
+        out.append(f"Enabled/state: {enabled}")
+        out.append(f"Active/Sub: {active}/{sub}")
+        out.append(f"Result/Status: {result}/{status}")
+        out.append(f"Restarts: {restarts}")
+
+        # journal tail (best effort) — do NOT exceed 5 evidence lines overall
+        j = _journal_tail_unit(unit, n=3)
+        if j:
+            # replace last line with a compact journal hint if we already hit 5
+            # We'll append only if we have room.
+            for ln in j:
+                if len(out) >= 5:
+                    break
+                out.append(f"journal: {ln}")
+
+        return out[:5]
+
+    # SECURITY
     if c == "SEC-01":
         ipm = re.search(r"\b(?:da|from)\s+([0-9a-fA-F\.:]+)\b", m)
         if ipm:
@@ -105,37 +246,7 @@ def _evidence_for_event(code: str, entity: str, msg: str) -> List[str]:
     return out[:5]
 
 
-def _why_for_event(code: str, msg: str) -> str:
-    code = (code or "").upper()
-
-    # HEALTH
-    if code == "HEA-01":
-        return "CPU temperature stayed ≥85°C for ≥30s (clears when ≤80°C for ≥60s)."
-    if code == "HEA-02":
-        return "CPU temperature stayed ≥95°C for ≥10s (clears when ≤90°C for ≥60s)."
-    if code == "HEA-03":
-        return "Disk usage exceeded the threshold for 2 consecutive checks (85% WARNING / 95% CRITICAL)."
-
-    # SECURITY
-    if code == "SEC-01":
-        return (
-            "Repeated SSH authentication failures from the same source within a short time window "
-            "(LAN may be downgraded; localhost is INFO)."
-        )
-    if code == "SEC-02":
-        return "Successful login correlated to previous SSH failures from the same IP within 10 minutes."
-    if code == "SEC-03":
-        return "Unusual sudo usage (first-seen user+command window) with escalation rules for suspicious context."
-    if code == "SEC-04":
-        return (
-            "A new listening service was detected (first-seen window); severity depends on bind scope "
-            "and sensitive ports."
-        )
-    if code == "SEC-05":
-        return "Integrity change detected on a critical config/auth file (hash changed with debounce)."
-
-    return "(rule details coming soon)"
-
+# ---------------- Advice ----------------
 
 ADVICE: Dict[str, List[str]] = {
     # SECURITY
@@ -181,9 +292,9 @@ ADVICE: Dict[str, List[str]] = {
         "If unexpected growth: investigate logs, runaway processes, snapshots.",
     ],
     "HEA-04": [
-        "Check the unit/service status and recent errors.",
-        "Verify configuration and dependencies.",
-        "If critical: temporarily disable to stabilize the system.",
+        "Check the unit/service status and recent errors (systemctl status / journalctl).",
+        "Verify configuration, dependencies, and any recent changes/deploys.",
+        "If critical: temporarily stop/disable to stabilize while investigating.",
     ],
     "HEA-05": [
         "Save work immediately: possible disk/filesystem errors.",
@@ -193,23 +304,7 @@ ADVICE: Dict[str, List[str]] = {
 }
 
 
-def _reports_dir() -> Path:
-    paths.ensure_dirs()
-    if hasattr(paths, "reports_dir"):
-        try:
-            p = Path(paths.reports_dir())  # type: ignore[attr-defined]
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except Exception:
-            pass
-    p = Path.home() / ".local/share/argus/reports"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _safe(s: str) -> str:
-    return "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in (s or ""))
-
+# ---------------- Rendering ----------------
 
 def render_markdown(event: Dict[str, Any]) -> str:
     ts = datetime.fromtimestamp(int(event["ts"])).strftime("%Y-%m-%d %H:%M:%S")
@@ -217,6 +312,7 @@ def render_markdown(event: Dict[str, Any]) -> str:
     sev = str(event.get("severity") or "INFO").upper()
     ent = str(event.get("entity") or "")
     msg = str(event.get("message") or "").strip()
+    details_json = str(event.get("details_json") or "")
 
     actions = ADVICE.get(code, [])
     if not actions:
@@ -227,8 +323,8 @@ def render_markdown(event: Dict[str, Any]) -> str:
         ]
     actions = (actions + ["(n/a)", "(n/a)", "(n/a)"])[:3]
 
-    why = _why_for_event(code, msg)
-    evidence = _evidence_for_event(code, ent, msg)
+    why = _why_for_event(code, msg, details_json)
+    evidence = _evidence_for_event(code, ent, msg, details_json)
 
     lines: List[str] = []
     lines.append(f"# ARGUS Report — {code} ({sev})")
@@ -280,6 +376,8 @@ def write_report(event: Dict[str, Any]) -> Tuple[str, str]:
 
     msg = str(event.get("message") or "")
     ent = str(event.get("entity") or "")
+    details_json = str(event.get("details_json") or "")
+
     payload = {
         "report_version": 2,
         "id": eid,
@@ -288,12 +386,55 @@ def write_report(event: Dict[str, Any]) -> Tuple[str, str]:
         "severity": str(event.get("severity") or "").upper(),
         "message": msg,
         "entity": ent,
-        "details_json": str(event.get("details_json") or ""),
+        "details_json": details_json,
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "why": _why_for_event(str(event.get("code") or ""), msg),
-        "evidence": _evidence_for_event(str(event.get("code") or ""), ent, msg),
+        "why": _why_for_event(str(event.get("code") or ""), msg, details_json),
+        "evidence": _evidence_for_event(str(event.get("code") or ""), ent, msg, details_json),
         "actions": ADVICE.get(str(event.get("code") or "").upper(), []),
     }
     js_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return str(md_path), str(js_path)
+
+def list_saved_reports(code: str | None = None) -> List[Dict[str, Any]]:
+    """
+    List already-saved reports from the reports directory (JSON payloads).
+    Returns a list sorted by event timestamp desc.
+    """
+    rep_dir = _reports_dir()
+    code_u = (code or "").upper().strip()
+
+    items: List[Dict[str, Any]] = []
+    for p in rep_dir.glob("report_*.json"):
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        c = str(payload.get("code") or "").upper()
+        if code_u and c != code_u:
+            continue
+
+        ts = int(payload.get("ts") or 0)
+        dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
+        sev = str(payload.get("severity") or "").upper() or "?"
+        ent = str(payload.get("entity") or "")
+
+        md = p.with_suffix(".md")
+        items.append(
+            {
+                "ts": ts,
+                "time": dt,
+                "code": c,
+                "severity": sev,
+                "entity": ent,
+                "md_path": str(md) if md.exists() else "",
+                "json_path": str(p),
+                "file": p.name,
+            }
+        )
+
+    items.sort(key=lambda x: x.get("ts", 0), reverse=True)
+    return items
