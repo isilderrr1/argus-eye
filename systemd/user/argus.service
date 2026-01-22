@@ -1,0 +1,22 @@
+[Unit]
+Description=ARGUS Eye (security + health monitor)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/argus-eye
+
+# Use the project venv + module entrypoint (stable for this repo)
+ExecStart=%h/projects/argus-eye/.venv/bin/python -m argus.cli run --log-path /var/log/auth.log
+
+Restart=on-failure
+RestartSec=2
+
+# Make sure PATH includes venv + common bins (helps if subprocess calls happen)
+Environment=PATH=%h/projects/argus-eye/.venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
