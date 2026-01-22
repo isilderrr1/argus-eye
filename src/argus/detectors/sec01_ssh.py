@@ -2,149 +2,147 @@ from __future__ import annotations
 
 import re
 import time
-from collections import deque
-from ipaddress import ip_address, ip_network
-from typing import Deque, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 
-# --- Regole v1 (come da specifica) ---
-WARN_WINDOW_SEC = 60          # 1 minuto
-CRIT_WINDOW_SEC = 120         # 2 minuti
-CRIT_THRESHOLD = 3            # 3 fallimenti in 2 minuti
-WARN_THRESHOLD = 1            # 1 fallimento in 1 minuto
-
-COOLDOWN_WARN_SEC = 60
-COOLDOWN_CRIT_SEC = 120
-
-
-LAN_NETS = [
-    ip_network("10.0.0.0/8"),
-    ip_network("172.16.0.0/12"),
-    ip_network("192.168.0.0/16"),
-    ip_network("100.64.0.0/10"),   # CGNAT
-    ip_network("169.254.0.0/16"),  # link-local
-    ip_network("fc00::/7"),        # IPv6 ULA
-    ip_network("fe80::/10"),       # IPv6 link-local
+_FAIL_PATTERNS = [
+    # Debian/Ubuntu sshd
+    re.compile(r"Failed password for (?:invalid user\s+)?(?P<user>\S+) from (?P<ip>\S+)", re.IGNORECASE),
+    re.compile(r"Invalid user (?P<user>\S+) from (?P<ip>\S+)", re.IGNORECASE),
+    # PAM-style (sometimes appears)
+    re.compile(r"authentication failure;.*rhost=(?P<ip>\S+).*user=(?P<user>\S*)", re.IGNORECASE),
 ]
 
 
-# ✅ NOTA: qui usiamo \S (non \\S) perché è una regex, e la stringa è raw (r"...")
-RE_FAILED = re.compile(
-    r"Failed (?:password|publickey) for (?:invalid user )?(?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+) port",
-    re.IGNORECASE,
-)
-RE_INVALID = re.compile(
-    r"Invalid user (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+) port",
-    re.IGNORECASE,
-)
-# PAM line può non contenere user=..., quindi lo rendiamo opzionale
-RE_PAM_FAIL = re.compile(
-    r"authentication failure;.*rhost=(?P<ip>[0-9a-fA-F:.]+)(?:\s+user=(?P<user>\S+))?",
-    re.IGNORECASE,
-)
+def _ip_scope(ip: str) -> str:
+    ip = (ip or "").strip()
+    if ip in ("127.0.0.1", "::1") or ip.startswith("127."):
+        return "LOCAL"
+    if ip.startswith("10.") or ip.startswith("192.168."):
+        return "LAN"
+    if ip.startswith("172."):
+        # 172.16.0.0/12
+        try:
+            second = int(ip.split(".", 2)[1])
+            if 16 <= second <= 31:
+                return "LAN"
+        except Exception:
+            pass
+    if ip.startswith("169.254."):
+        return "LAN"
+    return "GLOBAL"
 
 
-def _now() -> int:
-    return int(time.time())
+def _downgrade_by_scope(sev: str, scope: str) -> str:
+    sev = (sev or "").upper()
+    scope = (scope or "").upper()
 
-
-def ip_is_lan(ip_str: str) -> bool:
-    try:
-        ip = ip_address(ip_str)
-    except ValueError:
-        return False
-
-    if ip.is_loopback:
-        return True
-
-    for net in LAN_NETS:
-        if ip in net:
-            return True
-
-    if getattr(ip, "is_private", False):
-        return True
-
-    return False
-
-
-def downgrade_severity_for_lan(sev: str, is_lan: bool) -> str:
-    sev = sev.upper()
-    if not is_lan:
-        return sev
-    if sev == "CRITICAL":
-        return "WARNING"
-    if sev == "WARNING":
+    # Localhost = informational only
+    if scope == "LOCAL":
         return "INFO"
-    return "INFO"
+
+    # LAN may be less serious than GLOBAL
+    if scope == "LAN" and sev == "CRITICAL":
+        return "WARNING"
+
+    return sev
 
 
-def parse_ssh_failure(line: str) -> Optional[Tuple[str, str]]:
-    m = RE_FAILED.search(line)
-    if m:
-        return m.group("ip"), m.group("user")
-
-    m = RE_INVALID.search(line)
-    if m:
-        return m.group("ip"), m.group("user")
-
-    m = RE_PAM_FAIL.search(line)
-    if m:
-        ip = m.group("ip")
-        user = m.group("user") or "unknown"
-        return ip, user
-
-    return None
+@dataclass
+class _Bucket:
+    ts: List[int]
+    last_info_emit: int = 0
+    last_alert_emit: int = 0
 
 
 class SshBruteForceDetector:
-    def __init__(self) -> None:
-        self.failures: Dict[str, Deque[int]] = {}
-        self.last_emitted: Dict[Tuple[str, str], int] = {}
+    """
+    SEC-01: Detect repeated SSH authentication failures.
 
-    def _prune(self, q: Deque[int], window: int, now: int) -> None:
-        while q and (now - q[0]) > window:
-            q.popleft()
+    - Tracks failures per source IP in a sliding window
+    - Emits:
+        * INFO (rate-limited) for first-seen/occasional failures
+        * WARNING / CRITICAL when thresholds are reached
+    """
+
+    def __init__(
+        self,
+        window_s: int = 60,
+        warn_attempts: int = 5,
+        crit_attempts: int = 12,
+        info_cooldown_s: int = 120,
+        alert_cooldown_s: int = 60,
+    ) -> None:
+        self.window_s = int(window_s)
+        self.warn_attempts = int(warn_attempts)
+        self.crit_attempts = int(crit_attempts)
+        self.info_cooldown_s = int(info_cooldown_s)
+        self.alert_cooldown_s = int(alert_cooldown_s)
+
+        self._by_ip: Dict[str, _Bucket] = {}
+
+    def _prune(self, now: int, b: _Bucket) -> None:
+        cutoff = now - self.window_s
+        # keep only timestamps >= cutoff
+        b.ts = [t for t in b.ts if t >= cutoff]
+
+    def _parse_fail(self, line: str) -> Optional[Tuple[str, str]]:
+        for rx in _FAIL_PATTERNS:
+            m = rx.search(line or "")
+            if m:
+                user = (m.groupdict().get("user") or "").strip() or "unknown"
+                ip = (m.groupdict().get("ip") or "").strip()
+                if ip:
+                    return ip, user
+        return None
 
     def handle_line(self, line: str) -> Optional[Tuple[str, str, str]]:
-        parsed = parse_ssh_failure(line)
+        parsed = self._parse_fail(line)
         if not parsed:
             return None
 
         ip, user = parsed
-        now = _now()
+        now = int(time.time())
 
-        q = self.failures.setdefault(ip, deque())
-        q.append(now)
-        self._prune(q, CRIT_WINDOW_SEC, now)
+        b = self._by_ip.get(ip)
+        if b is None:
+            b = _Bucket(ts=[])
+            self._by_ip[ip] = b
 
-        count_2m = len(q)
-        count_1m = sum(1 for t in q if (now - t) <= WARN_WINDOW_SEC)
+        b.ts.append(now)
+        self._prune(now, b)
+        count = len(b.ts)
 
-        raw_sev: Optional[str] = None
-        if count_2m >= CRIT_THRESHOLD:
-            raw_sev = "CRITICAL"
-        elif count_1m >= WARN_THRESHOLD:
-            raw_sev = "WARNING"
+        scope = _ip_scope(ip)
 
-        if raw_sev is None:
+        # ALERT path
+        if count >= self.crit_attempts:
+            sev = _downgrade_by_scope("CRITICAL", scope)
+            if (now - b.last_alert_emit) >= self.alert_cooldown_s:
+                b.last_alert_emit = now
+                msg = (
+                    f"SSH brute-force suspected: {count} failed attempts in the last {self.window_s}s "
+                    f"from {ip} [{scope}]."
+                )
+                return sev, ip, msg
             return None
 
-        is_lan = ip_is_lan(ip)
-        sev = downgrade_severity_for_lan(raw_sev, is_lan)
-
-        cooldown = COOLDOWN_CRIT_SEC if raw_sev == "CRITICAL" else COOLDOWN_WARN_SEC
-        key = (ip, raw_sev)
-        last = self.last_emitted.get(key, 0)
-        if now - last < cooldown:
+        if count >= self.warn_attempts:
+            sev = _downgrade_by_scope("WARNING", scope)
+            if (now - b.last_alert_emit) >= self.alert_cooldown_s:
+                b.last_alert_emit = now
+                msg = (
+                    f"SSH brute-force suspected: {count} failed attempts in the last {self.window_s}s "
+                    f"from {ip} [{scope}]."
+                )
+                return sev, ip, msg
             return None
-        self.last_emitted[key] = now
 
-        if raw_sev == "CRITICAL":
-            msg = f"SSH brute-force sospetto da {ip}: {count_2m} fallimenti in 2 minuti (user={user})"
-        else:
-            msg = f"Tentativo SSH fallito da {ip}: {count_1m} fallimento in 1 minuto (user={user})"
+        # INFO path (rate-limited, to avoid noise)
+        if (now - b.last_info_emit) >= self.info_cooldown_s:
+            b.last_info_emit = now
+            msg = f"SSH authentication failed from {ip} (user={user}) [{scope}]."
+            return "INFO", ip, msg
 
-        if is_lan:
-            msg += " [LAN downgrade]"
-
-        return sev, ip, msg
+        return None
