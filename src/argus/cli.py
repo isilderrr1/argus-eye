@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Optional
 
 import typer
-
 from argus import __version__, db, paths
 from argus.monitor import run_authlog_security
 

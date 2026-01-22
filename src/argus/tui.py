@@ -10,19 +10,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from rich.console import Group
+from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Container, VerticalScroll
 from textual.reactive import reactive
-from textual.widgets import Static, ListView, ListItem, Label
+from textual.widgets import Label, ListItem, ListView, Static
 
 from argus import __version__ as ARGUS_VERSION
-from argus import db
+from argus import db, reporter
+from argus.collectors.temperature import format_cpu_temp
 from argus.trust import add_sec04_trust
 
-from argus.collectors.temperature import format_cpu_temp
-
+# ---------------- Icons ----------------
 
 CODE_ICON: Dict[str, str] = {
     "SEC-01": "🚫🔑",
@@ -37,59 +40,16 @@ CODE_ICON: Dict[str, str] = {
     "HEA-05": "🧱",
     "SYS": "🛈",
 }
-
 SEV_ICON = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "❗"}
 
+# SEC-04 message parsing (supports IT/EN, IPv4/IPv6-ish)
 RE_SEC04 = re.compile(
-    r"^(?:Nuovo servizio locale|Nuovo servizio in rete|Porta esposta):\s*"
-    r"(?P<proc>\S+)\s+su\s+(?P<addr>[^:]+):(?P<port>\d+)/(?P<proto>\w+).*\[(?P<bind>LOCAL|LAN|GLOBAL)\]",
+    r"(?:(?:Nuovo servizio locale|Nuovo servizio in rete|Porta esposta|New local service|New network service|Exposed port)\s*:\s*)?"
+    r"(?P<proc>\S+)\s+(?:su|on)\s+(?P<addr>\S+):(?P<port>\d+)/(?P<proto>\w+).*?\[(?P<bind>LOCAL|LAN|GLOBAL)\]",
     re.IGNORECASE,
 )
 
-ADVICE: Dict[str, List[str]] = {
-    "SEC-01": [
-        "If it wasn't you: change password and disable SSH if not needed.",
-        "Block the IP (ufw/nftables) and review users/SSH keys.",
-        "Check logs to see usernames targeted and frequency.",
-    ],
-    "SEC-02": [
-        "Confirm if the login was yours (IP, time, user).",
-        "If suspicious: change password and close active sessions.",
-        "Review recent commands and sudo activity (SEC-03).",
-    ],
-    "SEC-03": [
-        "If it wasn't you: change password and review local users.",
-        "Check what that command changed on the system.",
-        "High-risk: review passwd/sudoers/cron/systemctl changes.",
-    ],
-    "SEC-04": [
-        "Confirm the service is expected (process and port).",
-        "If not needed: close the port or disable the service.",
-        "If expected: press T to Trust (allowlist) to reduce noise.",
-    ],
-    "SEC-05": [
-        "If it wasn't you: verify what changed immediately.",
-        "Check maintenance/updates and related sudo activity (SEC-03).",
-        "Restore secure config and rotate credentials if needed.",
-    ],
-
-        "HEA-01": [
-        "Close heavy workloads (browser tabs, builds, VMs) and watch the temperature trend.",
-        "Check airflow and fans (dust, case airflow, laptop vents).",
-        "If it repeats: verify thermal paste / cooling profile / power limits.",
-    ],
-    "HEA-02": [
-        "Immediately stop heavy loads. If it doesn't drop within 60s, shut down to avoid damage.",
-        "Check cooler/pump/fans and ensure the CPU heatsink is properly seated.",
-        "Review recent changes: BIOS settings, turbo boost, fan curve, background tasks.",
-    ],
-    "HEA-03": [
-        "Free space on the affected mount (logs, downloads, cache).",
-        "Find what's large: du -xh --max-depth=1 <mount> | sort -h",
-        "If unexpected: check recent writes and consider moving data to another disk.",
-    ],
-
-}
+# ---------------- Helpers ----------------
 
 
 def _midnight_ts() -> int:
@@ -110,7 +70,7 @@ def _score(recent: List[dict], prefix: str) -> int:
     s = 0
     for e in recent:
         code = (e.get("code") or "")
-        if not code.startswith(prefix):
+        if not str(code).startswith(prefix):
             continue
         sev = (e.get("severity") or "").upper()
         if sev == "CRITICAL":
@@ -159,46 +119,6 @@ def _fmt_header(state: str, threat: int, health: int, temp: str, disk: str, run:
         f"👁 ARGUS | {state} | Threat {threat}/100 | Health {health}/100 | "
         f"🌡 {temp} | 💽 {disk} | 🔔 CRIT | {run}{mm_txt}"
     )
-
-def _why_for_event(code: str, msg: str) -> str:
-    code = (code or "").upper()
-    if code == "HEA-01":
-        return "CPU temperature stayed ≥85°C for ≥30s (clears when ≤80°C for ≥60s)."
-    if code == "HEA-02":
-        return "CPU temperature stayed ≥95°C for ≥10s (clears when ≤90°C for ≥60s)."
-    if code == "HEA-03":
-        return "Disk usage exceeded the threshold for 2 consecutive checks (85% WARNING / 95% CRITICAL)."
-    return "(rule details coming soon)"
-
-
-def _evidence_for_event(code: str, entity: str, msg: str) -> List[str]:
-    """
-    Best-effort evidence extraction from our own message/entity.
-    Keep it short (max 3-5 lines).
-    """
-    out: List[str] = []
-    c = (code or "").upper()
-
-    if c in ("HEA-01", "HEA-02"):
-        # try to extract "95°C" from message
-        m = re.search(r"(\d{2,3})\s*°C", msg)
-        if m:
-            out.append(f"Observed CPU temp: {m.group(1)}°C")
-        if entity:
-            out.append(f"Sensor/entity: {entity}")
-        out.append("Source: sysfs (/sys/class/thermal) or available provider")
-        return out[:5]
-
-    if c == "HEA-03":
-        if entity:
-            out.append(f"Mount: {entity}")
-        m = re.search(r"at\s+(\d{1,3})%", msg)
-        if m:
-            out.append(f"Used: {m.group(1)}%")
-        out.append("Source: statvfs (/proc/mounts + filesystem stats)")
-        return out[:5]
-
-    return out[:5]
 
 
 def _parse_sec03_key(key: str) -> tuple[str, str]:
@@ -264,7 +184,6 @@ def _get_lan_ip() -> str:
 
 
 def _logo_argus_lines() -> List[str]:
-    # 7-high readable block letters: ARGUS
     A = [
         "   ███   ",
         "  █   █  ",
@@ -380,7 +299,6 @@ class ArgusApp(App):
     .tiny #summary { display: none; }
     .tiny #detail_box { display: none; }
 
-
     /* Responsive helpers */
     .narrow #detail_box { display: none; }
     .narrow #summary { display: none; }
@@ -388,12 +306,12 @@ class ArgusApp(App):
     .tiny #overlay { display: none; }
     .tiny #summary { display: none; }
     .tiny #hdr { height: 2; }
-
     """
 
-    ui_mode = reactive("splash")        # splash|main
-    view_mode = reactive("dashboard")   # dashboard|minimal
+    ui_mode = reactive("splash")         # splash|main
+    view_mode = reactive("dashboard")    # dashboard|minimal
     show_details = reactive(True)
+    detail_mode = reactive("technical")  # technical|simple
 
     _selected: Optional[Selected] = None
     _last_feed_sig: Tuple[int, int] = (-1, -1)  # (top_id, count)
@@ -401,7 +319,6 @@ class ArgusApp(App):
     _detail_override_text: Optional[str] = None
     _detail_override_event_id: Optional[int] = None
 
-    # splash caching (avoid rebuilding banner every frame)
     _last_banner_text: str = ""
     _last_banner_update_ts: float = 0.0
 
@@ -410,6 +327,7 @@ class ArgusApp(App):
         ("x", "stop_monitor", "Stop"),
         ("d", "toggle_details", "Details"),
         ("v", "toggle_view", "View"),
+        ("h", "toggle_detail_mode", "Mode"),
         ("t", "trust_selected", "Trust"),
         ("k", "clear_events", "Clear"),
         ("m", "maintenance_30", "Maint 30m"),
@@ -444,15 +362,13 @@ class ArgusApp(App):
         self.set_interval(1.0, self._refresh)       # main refresh
         self._apply_responsive()
 
-
     # ---------------- Responsive layout ----------------
+
     def _apply_responsive(self) -> None:
         w, h = self.size.width, self.size.height
 
-        # Breakpoints
-        tiny  = (w < 92) or (h < 24)
+        tiny = (w < 92) or (h < 24)
         stack = (not tiny) and (w < 120)
-        wide  = (not tiny) and (not stack)
         short = h < 32
 
         scr = self.screen
@@ -464,7 +380,7 @@ class ArgusApp(App):
 
         self._layout_profile = "tiny" if tiny else ("stack" if stack else "wide")
 
-        # Preferenze utente (non perderle al resize)
+        # preserve user prefs across resize
         if not hasattr(self, "_user_view_mode"):
             self._user_view_mode = self.view_mode
         if not hasattr(self, "_user_show_details"):
@@ -486,10 +402,11 @@ class ArgusApp(App):
             self._apply_visibility()
             self._update_footerbar()
 
-    def on_resize(self, event) -> None:
+    def on_resize(self, event) -> None:  # textual event type varies by version
         self._apply_responsive()
 
-    # -------- Key handling (robust Enter/Esc) --------
+    # -------- Key handling --------
+
     def on_key(self, event: events.Key) -> None:
         k = (event.key or "").lower()
 
@@ -508,6 +425,7 @@ class ArgusApp(App):
             return
 
     # ---------------- Splash ----------------
+
     def action_continue(self) -> None:
         self.ui_mode = "main"
         self._apply_global_visibility()
@@ -540,8 +458,8 @@ class ArgusApp(App):
         return "\n".join((line0, line1, line2))
 
     # ---------------- Digit-cascade (ARGUS made of 0/1 encoding "I watch U") ----------------
+
     def _dm_ensure(self) -> None:
-        # keep one-screen compact
         w = max(56, min(self.size.width - 6, 120))
         h = 12
 
@@ -578,10 +496,9 @@ class ArgusApp(App):
         self._dm_filled = {}   # (x,y) -> digit
         self._dm_falling = {}  # x -> (y, digit, target_y)
 
-        # map each target cell to a bit (ASCII bits of "I watch U")
         msg = "I watch U"
         bits = "".join(f"{b:08b}" for b in msg.encode("ascii"))
-        ordered = sorted(targets, key=lambda t: (t[1], t[0]))  # row-major
+        ordered = sorted(targets, key=lambda t: (t[1], t[0]))
         self._dm_target_digit = {pos: bits[i % len(bits)] for i, pos in enumerate(ordered)}
 
     def _dm_step(self) -> None:
@@ -589,7 +506,6 @@ class ArgusApp(App):
         if self._dm_done:
             return
 
-        # spawn per column if needed (one falling digit per column)
         for x, ys in self._dm_targets_by_col.items():
             if x in self._dm_falling:
                 continue
@@ -605,7 +521,6 @@ class ArgusApp(App):
             d = self._dm_target_digit.get((x, next_ty), "0")
             self._dm_falling[x] = (-1, d, next_ty)
 
-        # advance + lock
         new_falling = {}
         for x, (y, d, ty) in self._dm_falling.items():
             y2 = y + 1
@@ -634,7 +549,6 @@ class ArgusApp(App):
 
         txt = Text("\n".join("".join(r) for r in grid), style="green")
 
-        # bold target cells so ARGUS pops
         for (x, y) in self._dm_targets:
             idx = y * (w + 1) + x
             if 0 <= idx < len(txt):
@@ -676,7 +590,6 @@ class ArgusApp(App):
         matrix = self.query_one("#splash_matrix", Static)
         body = self.query_one("#splash_body", Static)
 
-        # banner: update at most twice per second (uptime changes)
         now = time.time()
         if force_banner or (now - self._last_banner_update_ts) >= 0.5:
             btxt = self._splash_banner_text()
@@ -695,12 +608,15 @@ class ArgusApp(App):
         self._render_splash()
 
     # ---------------- Main UI ----------------
+
     def action_toggle_view(self) -> None:
         if self.ui_mode != "main":
             return
         self.view_mode = "minimal" if self.view_mode == "dashboard" else "dashboard"
         self._user_view_mode = self.view_mode
         self._apply_visibility()
+        self._update_footerbar()
+        self._update_detail()
 
     def action_toggle_details(self) -> None:
         if self.ui_mode != "main":
@@ -708,6 +624,14 @@ class ArgusApp(App):
         self.show_details = not self.show_details
         self._user_show_details = self.show_details
         self._apply_visibility()
+        self._update_footerbar()
+
+    def action_toggle_detail_mode(self) -> None:
+        if self.ui_mode != "main":
+            return
+        self.detail_mode = "simple" if self.detail_mode == "technical" else "technical"
+        self._update_detail()
+        self._update_footerbar()
 
     def _apply_visibility(self) -> None:
         summary = self.query_one("#summary", Static)
@@ -844,7 +768,7 @@ class ArgusApp(App):
 
         self._detail_override_text = txt
         self._detail_override_event_id = eid
-        self.query_one("#detail_text", Static).update(txt)
+        self.query_one("#detail_text", Static).update(Markdown(txt))
 
     def action_trust_selected(self) -> None:
         if self.ui_mode != "main":
@@ -891,63 +815,155 @@ class ArgusApp(App):
             self._selected = Selected(event=item.event)
             self._update_detail()
 
+    # ---------------- Details “card” ----------------
 
     def _update_detail(self) -> None:
         if self.ui_mode != "main":
             return
 
-        detail_text = self.query_one("#detail_text", Static)
+        detail = self.query_one("#detail_text", Static)
+
         if not self._selected:
-            detail_text.update("")
+            detail.update("")
             return
 
         e = self._selected.event
         eid = int(e.get("id") or 0)
 
+        # keep opened report if still same event
         if self._detail_override_text is not None and self._detail_override_event_id == eid:
-            detail_text.update(self._detail_override_text)
+            detail.update(Markdown(self._detail_override_text))
             return
 
         ts = datetime.fromtimestamp(int(e["ts"])).strftime("%Y-%m-%d %H:%M:%S")
         sev = (e.get("severity") or "INFO").upper()
-        code = (e.get("code") or "")
+        code = (e.get("code") or "").upper()
         ent = (e.get("entity") or "")
         msg = (e.get("message") or "").strip()
+        details_json = str(e.get("details_json") or "")
 
-        why = _why_for_event(code, msg)
-        evid = _evidence_for_event(code, ent, msg)
-        evid_txt = "\n".join([f"  • {x}" for x in evid]) if evid else "  • (no evidence captured)"
+        # reporter integrations (robust to signature changes)
+        why = "(rule details coming soon)"
+        actions: List[str] = []
+        evidence: List[str] = []
 
-        advice = ADVICE.get(code, [])
-        advice_txt = "\n".join([f"  • {a}" for a in advice]) if advice else "  • (actions coming soon)"
+        try:
+            why = reporter._why_for_event(code, msg, details_json)  # type: ignore[attr-defined]
+        except TypeError:
+            try:
+                why = reporter._why_for_event(code, msg)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            actions = list(reporter.ADVICE.get(code, []))  # type: ignore[attr-defined]
+        except Exception:
+            actions = []
+
+        try:
+            evidence = reporter._evidence_for_event(code, ent, msg, details_json)  # type: ignore[attr-defined]
+        except TypeError:
+            try:
+                evidence = reporter._evidence_for_event(code, ent, msg)  # type: ignore[attr-defined]
+            except Exception:
+                evidence = []
+        except Exception:
+            evidence = []
+
+        if not actions:
+            actions = [
+                "Confirm whether this was expected.",
+                "If unexpected: inspect logs around the timestamp.",
+                "Apply mitigation steps appropriate for this event type.",
+            ]
+
+        icon = CODE_ICON.get(code, "•")
+        sev_i = SEV_ICON.get(sev, "•")
+        sev_color = {"INFO": "cyan", "WARNING": "yellow", "CRITICAL": "red"}.get(sev, "white")
+        border = {"INFO": "cyan", "WARNING": "yellow", "CRITICAL": "red"}.get(sev, "white")
+
         has_report = "YES" if (e.get("report_md_path") or "").strip() else "NO"
 
-        detail_text.update(
-            "\n".join(
-                [
-                    f"{code} ({sev})",
-                    f"{ts}",
-                    "",
-                    "What happened",
-                    f"  {msg}",
-                    "",
-                    "Why it triggered",
-                    f"  {why}",
-                    "",
-                    "Entity",
-                    f"  {ent if ent else '(n/a)'}",
-                    "",
-                    "Evidence",
-                    f"{evid_txt}",
-                    "",
-                    "What to do now",
-                    f"{advice_txt}",
-                    "",
-                    f"Report: {has_report}  (Enter opens, Esc goes back)",
-                ]
-            )
-        )
+        header = Text(f"{sev_i}  {icon}  {code}  ", style="bold")
+        header.append(sev, style=f"bold {sev_color}")
 
+        meta = Text()
+        meta.append("🕒 ", style="dim")
+        meta.append(ts, style="dim")
+        meta.append("   ")
+        meta.append("🧩 ", style="dim")
+        meta.append(ent if ent else "—", style="dim")
+        meta.append("   ")
+        meta.append("📄 ", style="dim")
+        meta.append(f"Report {has_report}", style="dim")
+        meta.append("   ")
+        meta.append("🧠 ", style="dim")
+        meta.append("Simple" if self.detail_mode == "simple" else "Technical", style="dim")
+
+        what_title = Text("WHAT HAPPENED", style="bold white")
+        what_body = Text(msg if msg else "(n/a)")
+
+        do_title = Text("WHAT TO DO NOW", style="bold white")
+        do_body = Text()
+        for i, a in enumerate(actions[:3], start=1):
+            do_body.append(f"{i}) {a}\n")
+        if str(do_body).endswith("\n"):
+            do_body = Text(str(do_body).rstrip("\n"))
+
+        hint = Text("Enter: open saved report  •  Esc: back to details  •  H: simple/technical  •  T: Trust (SEC-04)", style="dim")
+
+        if self.detail_mode == "simple":
+            content = Group(
+                header,
+                meta,
+                Text(""),
+                what_title,
+                what_body,
+                Text(""),
+                do_title,
+                do_body,
+                Text(""),
+                hint,
+            )
+            detail.update(Panel(content, border_style=border, padding=(1, 2)))
+            return
+
+        # technical mode
+        why_title = Text("WHY THIS TRIGGERED", style="bold white")
+        why_body = Text(why)
+
+        ev_title = Text("EVIDENCE", style="bold white")
+        if evidence:
+            ev_body = Text()
+            for x in evidence[:5]:
+                ev_body.append(f"• {x}\n")
+            ev_body = Text(str(ev_body).rstrip("\n"))
+        else:
+            ev_body = Text("• (no evidence available)", style="dim")
+
+        content = Group(
+            header,
+            meta,
+            Text(""),
+            what_title,
+            what_body,
+            Text(""),
+            why_title,
+            why_body,
+            Text(""),
+            do_title,
+            do_body,
+            Text(""),
+            ev_title,
+            ev_body,
+            Text(""),
+            hint,
+        )
+        detail.update(Panel(content, border_style=border, padding=(1, 2)))
+
+    # ---------------- Footer ----------------
 
     def _update_footerbar(self) -> None:
         if self.ui_mode != "main":
@@ -979,6 +995,7 @@ class ArgusApp(App):
         prof = getattr(self, "_layout_profile", "wide")
         det_on = (self.view_mode == "dashboard" and self.show_details and (self.size.width >= 100 or prof == "stack"))
         det = "ON" if det_on else "OFF"
+        mode = "Simple" if self.detail_mode == "simple" else "Tech"
 
         flags = []
         if _flag_badge("mute"):
@@ -995,6 +1012,7 @@ class ArgusApp(App):
                 f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
                 f"{cap('D')}[dim] Details[/dim]  "
                 f"{cap('V')}[dim] View[/dim]  "
+                f"{cap('H')}[dim] Mode[/dim]  "
                 f"{cap('T')}[dim] Trust[/dim]  "
                 f"{cap('K')}[dim] Clear[/dim]  "
                 f"{cap('M')}[dim] Maint[/dim]  "
@@ -1008,6 +1026,7 @@ class ArgusApp(App):
                 f"{cap('S', OK_BG)}[dim] Start[/dim]  "
                 f"{cap('X', DANGER_BG)}[dim] Stop[/dim]  "
                 f"{cap('V')}[dim] View[/dim]  "
+                f"{cap('H')}[dim] Mode[/dim]  "
                 f"{cap('D')}[dim] Details[/dim]  "
                 f"{cap('Enter', OK_BG)}[dim] Report[/dim]  "
                 f"{cap('Q', DANGER_BG)}[dim] Quit[/dim]"
@@ -1024,10 +1043,13 @@ class ArgusApp(App):
             f"[bold]STATE[/bold] [{state_col}]{state}[/{state_col}]  {DIM} "
             f"[bold]VIEW[/bold] {view}  {DIM} "
             f"[bold]DETAILS[/bold] {det}  {DIM} "
+            f"[bold]MODE[/bold] {mode}  {DIM} "
             f"[bold]FLAGS[/bold] {flags_txt}"
         )
 
-        footer.update(line1 + "\\n" + line2)
+        footer.update(line1 + "\n" + line2)
+
+    # ---------------- Refresh loop ----------------
 
     def _refresh(self) -> None:
         if self.ui_mode != "main":
@@ -1053,12 +1075,12 @@ class ArgusApp(App):
         threat = _score(last_10m, "SEC-")
         health = _score(last_10m, "HEA-")
 
-        # --- Health header signals ---
         temp = format_cpu_temp()
 
         disk = "--%"
         try:
-            from argus.collectors.disk import root_used_pct
+            from argus.collectors.disk import root_used_pct  # type: ignore
+
             pct = root_used_pct()
             disk = f"{pct}%" if pct is not None else "--%"
         except Exception:
@@ -1067,25 +1089,23 @@ class ArgusApp(App):
         run = _status_runstop()
         hdr.update(_fmt_header(state, threat, health, temp, disk, run))
 
-        # --- Overlay: active CRITICAL ---
         crit_now = [e for e in last_10m if (e.get("severity") or "").upper() == "CRITICAL"]
         crit_now = sorted(crit_now, key=lambda x: int(x["ts"]), reverse=True)[:3]
         if crit_now:
-            lines = ["ATTIVI ORA"]
-            for e in crit_now:
-                lines.append("  " + _fmt_event_line(e))
+            lines = ["ACTIVE CRITICAL"]
+            for ev in crit_now:
+                lines.append("  " + _fmt_event_line(ev))
             overlay.update("\n".join(lines))
         else:
             overlay.update("")
 
-        # --- Summary (dashboard only) ---
         if self.view_mode == "dashboard":
             counts_today: Dict[str, int] = {}
-            for e in visible:
-                if int(e.get("ts", 0)) < midnight:
+            for ev in visible:
+                if int(ev.get("ts", 0)) < midnight:
                     continue
-                c = (e.get("code") or "")
-                if c.startswith("SEC-"):
+                c = (ev.get("code") or "")
+                if str(c).startswith("SEC-"):
                     counts_today[c] = counts_today.get(c, 0) + 1
 
             sec03_today = db.list_first_seen(prefix="sec03|", since_ts=midnight, limit=5)
@@ -1133,14 +1153,13 @@ class ArgusApp(App):
         else:
             summary.update("")
 
-        # --- Feed update ---
         if feed_sig != self._last_feed_sig:
             self._last_feed_sig = feed_sig
             old_index = lv.index
 
             lv.clear()
-            for e in visible[:20]:
-                lv.append(EventRow(e))
+            for ev in visible[:20]:
+                lv.append(EventRow(ev))
 
             if len(lv.children) > 0:
                 if old_index is not None:
