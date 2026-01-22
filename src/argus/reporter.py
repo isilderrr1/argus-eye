@@ -69,10 +69,13 @@ def _journal_tail_unit(unit: str, n: int = 3) -> List[str]:
         if r.returncode != 0:
             return []
         lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
-        # keep only last n lines
         return lines[-n:]
     except Exception:
         return []
+
+
+def _kb_to_mb(kb: int) -> int:
+    return int(kb // 1024)
 
 
 # ---------------- Why / Evidence ----------------
@@ -102,6 +105,23 @@ def _why_for_event(code: str, msg: str, details_json: str = "") -> str:
             f"Runtime status was active='{active}', sub='{sub}', result='{result}'. "
             "ARGUS triggers when a monitored unit is enabled but not running/healthy, "
             "or when systemd reports a failure state."
+        )
+
+    if code_u == "HEA-05":
+        thr = d.get("thresholds") or {}
+        wm = thr.get("warn_mem_avail_pct", 10)
+        cm = thr.get("crit_mem_avail_pct", 5)
+        ws = thr.get("warn_swap_used_pct", 70)
+        cs = thr.get("crit_swap_used_pct", 90)
+        wo = thr.get("warn_swapout_ps", 200)
+        co = thr.get("crit_swapout_ps", 1000)
+
+        return (
+            "Memory pressure detected using MemAvailable + swap activity. "
+            f"Triggers when MemAvailable ≤ {wm}% (WARNING) / ≤ {cm}% (CRITICAL), "
+            f"or SwapUsed ≥ {ws}% (WARNING) / ≥ {cs}% (CRITICAL), "
+            f"or swapout ≥ {wo} pages/s (WARNING) / ≥ {co} pages/s (CRITICAL). "
+            "High swapout usually means thrashing and a sluggish/frozen desktop."
         )
 
     # SECURITY
@@ -167,15 +187,54 @@ def _evidence_for_event(code: str, entity: str, msg: str, details_json: str = ""
         out.append(f"Result/Status: {result}/{status}")
         out.append(f"Restarts: {restarts}")
 
-        # journal tail (best effort) — do NOT exceed 5 evidence lines overall
         j = _journal_tail_unit(unit, n=3)
         if j:
-            # replace last line with a compact journal hint if we already hit 5
-            # We'll append only if we have room.
             for ln in j:
                 if len(out) >= 5:
                     break
                 out.append(f"journal: {ln}")
+
+        return out[:5]
+
+    if c == "HEA-05":
+        mem_total_kb = int(d.get("mem_total_kb") or 0)
+        mem_av_kb = int(d.get("mem_available_kb") or 0)
+        mem_av_pct = d.get("mem_available_pct")
+
+        swap_total_kb = int(d.get("swap_total_kb") or 0)
+        swap_used_kb = int(d.get("swap_used_kb") or 0)
+        swap_used_pct = d.get("swap_used_pct")
+
+        swapin_ps = d.get("swapin_ps")
+        swapout_ps = d.get("swapout_ps")
+
+        if mem_total_kb > 0:
+            out.append(
+                f"MemAvailable: {float(mem_av_pct or 0.0):.2f}% ({_kb_to_mb(mem_av_kb)}MB/{_kb_to_mb(mem_total_kb)}MB)"
+            )
+        if swap_total_kb > 0:
+            out.append(
+                f"SwapUsed: {float(swap_used_pct or 0.0):.2f}% ({_kb_to_mb(swap_used_kb)}MB/{_kb_to_mb(swap_total_kb)}MB)"
+            )
+        if swapout_ps is not None:
+            out.append(f"swapout: {float(swapout_ps):.2f} pages/s")
+        if swapin_ps is not None:
+            out.append(f"swapin: {float(swapin_ps):.2f} pages/s")
+
+        # if we still have room, show top process (compressed)
+        tps = d.get("top_processes")
+        if isinstance(tps, list) and tps:
+            # show only the biggest one (keep evidence compact)
+            tp0 = tps[0] if isinstance(tps[0], dict) else None
+            if isinstance(tp0, dict):
+                pid = tp0.get("pid")
+                name = tp0.get("name") or "?"
+                rss_kb = int(tp0.get("rss_kb") or 0)
+                out.append(f"Top RSS: pid={pid} {name} rss={_kb_to_mb(rss_kb)}MB")
+
+        # always show source line if space
+        if len(out) < 5:
+            out.append("Source: /proc/meminfo + /proc/vmstat (+ /proc/<pid>/status for top RSS)")
 
         return out[:5]
 
@@ -297,9 +356,9 @@ ADVICE: Dict[str, List[str]] = {
         "If critical: temporarily stop/disable to stabilize while investigating.",
     ],
     "HEA-05": [
-        "Save work immediately: possible disk/filesystem errors.",
-        "Check SMART and kernel/journal logs.",
-        "Run fsck if applicable and plan backups.",
+        "Identify the top memory consumer (htop) and close/kill it to stop thrashing.",
+        "Check swap + OOM events (free -h, swapon --show, journalctl -k -b | grep -i oom).",
+        "If recurring: reduce background apps/VMs, consider increasing RAM/swap or tuning swappiness.",
     ],
 }
 
@@ -395,6 +454,7 @@ def write_report(event: Dict[str, Any]) -> Tuple[str, str]:
     js_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return str(md_path), str(js_path)
+
 
 def list_saved_reports(code: str | None = None) -> List[Dict[str, Any]]:
     """

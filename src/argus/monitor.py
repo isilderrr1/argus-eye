@@ -7,9 +7,11 @@ import typer
 from argus import db
 from argus.collectors.authlog import tail_file
 from argus.collectors.temperature import read_cpu_temp_c
+from argus.collectors.memory import snapshot as memory_snapshot
 from argus.detectors.hea_disk import DiskUsageDetector
 from argus.detectors.hea_services import HeaServicesDetector
 from argus.detectors.hea_temperature import TemperatureDetector
+from argus.detectors.hea_memory import MemoryPressureDetector
 from argus.detectors.sec01_ssh import SshBruteForceDetector
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
 from argus.detectors.sec03_sudo import SudoActivityDetector
@@ -95,10 +97,7 @@ def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
 def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
     """
     HEA-04: systemd service health.
-    We call detector frequently, but it will internally rate-limit (debounce/interval).
-    Supports both styles:
-      - det.poll() -> iterable of tuples
-      - det.tick(now_ts) -> emits events internally
+    Called frequently, detector internally rate-limits.
     """
     det = HeaServicesDetector(interval_s=15)
 
@@ -129,7 +128,6 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
                     db.add_event(code=str(code), severity=str(sev), message=str(msg), entity=str(entity))
                     typer.echo(f"[{code}] {str(sev):<8} {entity}  {msg}")
             else:
-                # tick-style detector (emits to DB inside)
                 now_ts = int(time.time())
                 det.tick(now_ts)  # type: ignore[attr-defined]
         except Exception as e:
@@ -138,11 +136,41 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
         stop.wait(interval_s)
 
 
+def _hea05_loop(stop: threading.Event, interval_s: int = 5) -> None:
+    """
+    HEA-05: Memory pressure (MemAvailable + swap thrashing)
+    """
+    det = MemoryPressureDetector()
+
+    # baseline (no events)
+    try:
+        det.poll(memory_snapshot())
+    except Exception:
+        pass
+
+    while not stop.is_set():
+        try:
+            snap = memory_snapshot()
+            for sev, entity, msg, details_json in det.poll(snap):
+                db.add_event(
+                    code="HEA-05",
+                    severity=sev,
+                    message=msg,
+                    entity=str(entity),
+                    details_json=details_json,
+                )
+                typer.echo(f"[HEA-05] {sev:<8} {entity}  {msg}")
+        except Exception as e:
+            typer.echo(f"[HEA-05] ERROR    memory-scan failed: {e!r}")
+
+        stop.wait(interval_s)
+
+
 def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     """
     Foreground monitor:
       - tail auth.log -> SEC-01/02/03
-      - background poll threads -> SEC-04, SEC-05, HEA-01/02, HEA-03, HEA-04
+      - background poll threads -> SEC-04, SEC-05, HEA-01/02, HEA-03, HEA-04, HEA-05
     """
     db.init_db()
 
@@ -166,12 +194,14 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     t_temp  = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
     t_disk  = threading.Thread(target=_hea03_loop, args=(stop,), daemon=True)
     t_svc   = threading.Thread(target=_hea04_loop, args=(stop,), daemon=True)
+    t_mem   = threading.Thread(target=_hea05_loop, args=(stop,), daemon=True)
 
     t_sec04.start()
     t_sec05.start()
     t_temp.start()
     t_disk.start()
     t_svc.start()
+    t_mem.start()
 
     time.sleep(0.2)
 
@@ -206,3 +236,4 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         t_temp.join(timeout=2)
         t_disk.join(timeout=2)
         t_svc.join(timeout=2)
+        t_mem.join(timeout=2)
