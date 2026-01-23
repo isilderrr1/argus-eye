@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 import time
 import typer
@@ -8,10 +9,12 @@ from argus import db
 from argus.collectors.authlog import tail_file
 from argus.collectors.temperature import read_cpu_temp_c
 from argus.collectors.memory import snapshot as memory_snapshot
+
 from argus.detectors.hea_disk import DiskUsageDetector
 from argus.detectors.hea_services import HeaServicesDetector
 from argus.detectors.hea_temperature import TemperatureDetector
 from argus.detectors.hea_memory import MemoryPressureDetector
+
 from argus.detectors.sec01_ssh import SshBruteForceDetector
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
 from argus.detectors.sec03_sudo import SudoActivityDetector
@@ -21,9 +24,7 @@ from argus.detectors.sec05_file_integrity import FileIntegrityDetector
 
 def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = ListeningPortDetector()
-
-    # baseline (no events)
-    det.poll()
+    det.poll()  # baseline
 
     while not stop.is_set():
         try:
@@ -38,9 +39,7 @@ def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
 
 def _sec05_loop(stop: threading.Event, interval_s: int = 10) -> None:
     det = FileIntegrityDetector()
-
-    # baseline (no events)
-    det.poll()
+    det.poll()  # baseline
 
     while not stop.is_set():
         try:
@@ -71,15 +70,11 @@ def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
 
 def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = DiskUsageDetector()
-
-    # prime poll (no events)
-    det.poll()
+    det.poll()  # baseline
 
     while not stop.is_set():
         try:
-            for item in det.poll():
-                # item can be (sev, entity, msg, details_json)
-                sev, entity, msg, details_json = item
+            for sev, entity, msg, details_json in det.poll():
                 db.add_event(
                     code="HEA-03",
                     severity=sev,
@@ -101,7 +96,7 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
     """
     det = HeaServicesDetector(interval_s=15)
 
-    # baseline if detector supports it
+    # baseline best-effort
     if hasattr(det, "poll"):
         try:
             _ = list(det.poll())  # type: ignore[attr-defined]
@@ -112,9 +107,6 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
         try:
             if hasattr(det, "poll"):
                 for item in det.poll():  # type: ignore[attr-defined]
-                    # accepted shapes:
-                    #   (sev, entity, msg)
-                    #   (code, sev, entity, msg)
                     if not item:
                         continue
                     if len(item) == 3:
@@ -128,8 +120,7 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
                     db.add_event(code=str(code), severity=str(sev), message=str(msg), entity=str(entity))
                     typer.echo(f"[{code}] {str(sev):<8} {entity}  {msg}")
             else:
-                now_ts = int(time.time())
-                det.tick(now_ts)  # type: ignore[attr-defined]
+                det.tick(int(time.time()))  # type: ignore[attr-defined]
         except Exception as e:
             typer.echo(f"[HEA-04] ERROR    service-scan failed: {e!r}")
 
@@ -137,12 +128,10 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
 
 
 def _hea05_loop(stop: threading.Event, interval_s: int = 5) -> None:
-    """
-    HEA-05: Memory pressure (MemAvailable + swap thrashing)
-    """
+    """HEA-05: Memory pressure (MemAvailable + swap thrashing)."""
     det = MemoryPressureDetector()
 
-    # baseline (no events)
+    # baseline
     try:
         det.poll(memory_snapshot())
     except Exception:
@@ -185,10 +174,21 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     ]
 
     typer.echo(f"[argus] Monitor: auth.log -> {log_path}")
-    typer.echo("[argus] Premi CTRL+C per fermare.")
+    typer.echo("[argus] Press CTRL+C to stop (systemd stop sends SIGTERM).")
 
     stop = threading.Event()
 
+    # ---- systemd stop support (SIGTERM) ----
+    def _handle_term(signum, frame):
+        raise KeyboardInterrupt()
+
+    old_term = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, _handle_term)
+    except Exception:
+        old_term = None  # not supported
+
+    # background threads
     t_sec04 = threading.Thread(target=_sec04_loop, args=(stop,), daemon=True)
     t_sec05 = threading.Thread(target=_sec05_loop, args=(stop,), daemon=True)
     t_temp  = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
@@ -222,13 +222,13 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
                 typer.echo(f"[{code}] {severity:<8} {entity}  {message}")
 
     except PermissionError:
-        typer.echo(f"[argus] Permesso negato su {log_path}.")
-        typer.echo("[argus] Soluzione tipica su Ubuntu: aggiungi l'utente al gruppo 'adm':")
+        typer.echo(f"[argus] Permission denied on {log_path}.")
+        typer.echo("[argus] Typical fix on Ubuntu: add user to group 'adm':")
         typer.echo("        sudo usermod -aG adm $USER")
-        typer.echo("        poi fai logout/login (o riavvia).")
+        typer.echo("        then logout/login (or reboot).")
         raise
     except KeyboardInterrupt:
-        typer.echo("\n[argus] Stop richiesto dall'utente. (CTRL+C)")
+        typer.echo("\n[argus] Stop requested (SIGTERM/CTRL+C).")
     finally:
         stop.set()
         t_sec04.join(timeout=2)
@@ -237,3 +237,9 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         t_disk.join(timeout=2)
         t_svc.join(timeout=2)
         t_mem.join(timeout=2)
+
+        if old_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, old_term)
+            except Exception:
+                pass

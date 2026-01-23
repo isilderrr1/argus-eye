@@ -2,35 +2,27 @@ from __future__ import annotations
 
 import re
 import time
+import shutil
+import subprocess
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 
 import typer
-from argus import __version__, db, paths
+
+from argus import __version__, paths, db
+from argus.collectors.authlog import tail_file
+from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
 from argus.monitor import run_authlog_security
 
-app = typer.Typer(
-    add_completion=False,
-    invoke_without_command=True,
-    help=(
-        "ARGUS — Linux security + health monitor (TUI + CLI).\n\n"
-        "Run without subcommands to open the dashboard (TUI)."
-    ),
-)
-
-debug_app = typer.Typer(
-    help="Developer/debug commands (may be noisy).",
-    add_completion=False,
-)
-
-app.add_typer(debug_app, name="debug")
+app = typer.Typer(add_completion=False, invoke_without_command=True)
 
 _DUR_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.IGNORECASE)
+_SERVICE = "argus.service"
 
 
 def parse_duration(s: str) -> int:
-    """Parse duration like: 30s, 10m, 1h, 2d -> seconds."""
-    m = _DUR_RE.match(s or "")
+    """Parse durations like: 30s, 10m, 1h, 2d -> seconds."""
+    m = _DUR_RE.match(s)
     if not m:
         raise typer.BadParameter("Invalid duration. Use: 30s, 10m, 1h, 2d")
     n = int(m.group(1))
@@ -40,7 +32,7 @@ def parse_duration(s: str) -> int:
 
 
 def fmt_seconds(sec: int) -> str:
-    """Human-friendly seconds (e.g. 9m12s / 1h05m)."""
+    """Human friendly seconds (e.g. 9m12s / 1h05m)."""
     if sec < 60:
         return f"{sec}s"
     m, s = divmod(sec, 60)
@@ -61,74 +53,235 @@ def get_state() -> str:
     return data[0]
 
 
+def _systemctl_user(args: list[str], timeout: float = 2.5) -> Optional[subprocess.CompletedProcess]:
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+
+
+def _systemd_available() -> bool:
+    r = _systemctl_user(["is-system-running"], timeout=1.5)
+    if r is None:
+        return False
+    # If systemd user bus isn't available you typically see "Failed to connect to bus"
+    if (r.stderr or "").lower().find("failed to connect to bus") >= 0:
+        return False
+    return True
+
+
+def _service_info() -> Optional[Dict[str, str]]:
+    if not _systemd_available():
+        return None
+    r = _systemctl_user(
+        ["show", _SERVICE, "--no-pager", "--property=ActiveState,SubState,UnitFileState,Result,ExecMainStatus"],
+        timeout=2.0,
+    )
+    if r is None or r.returncode != 0:
+        return None
+
+    info: Dict[str, str] = {}
+    for ln in (r.stdout or "").splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            info[k.strip()] = v.strip()
+    return info
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    version: bool = typer.Option(False, "--version", help="Show version and exit."),
-) -> None:
+    version: bool = typer.Option(False, "--version", help="Show version and exit"),
+):
     paths.ensure_dirs()
     db.init_db()
 
     from argus.config import ensure_config_exists
-
     ensure_config_exists()
 
     if version:
         typer.echo(f"argus {__version__}")
-        raise typer.Exit(code=0)
+        raise typer.Exit()
 
-    # No subcommand -> open TUI
     if ctx.invoked_subcommand is None:
         from argus.tui import ArgusApp
-
         ArgusApp().run()
-        raise typer.Exit(code=0)
+        raise typer.Exit()
 
-
-# ----------------------------
-# User-facing commands
-# ----------------------------
 
 @app.command()
-def status() -> None:
-    """Show monitor state (RUNNING/STOPPED) and runtime flags."""
-    state = get_state()
+def status():
+    """Show state (RUNNING/STOPPED) + runtime flags."""
+    # Prefer systemd user service state when available
+    info = _service_info()
+    if info:
+        active = (info.get("ActiveState") or "unknown").lower()
+        sub = (info.get("SubState") or "unknown").lower()
+        enabled = (info.get("UnitFileState") or "unknown").lower()
+
+        if active == "active":
+            state = "RUNNING"
+        elif active in ("activating",):
+            state = "STARTING"
+        elif active in ("deactivating",):
+            state = "STOPPING"
+        else:
+            state = "STOPPED"
+
+        typer.echo(f"STATE: {state}")
+        typer.echo(f"SERVICE: {active}/{sub}  enabled={enabled}")
+    else:
+        state = get_state()
+        typer.echo(f"STATE: {state}")
+        typer.echo("SERVICE: (systemd user not available)")
+
     mute_left = db.remaining_seconds("mute")
     maint_left = db.remaining_seconds("maintenance")
 
-    typer.echo(f"STATE: {state}")
     typer.echo("MUTE: OFF" if mute_left is None else f"MUTE: ON ({fmt_seconds(mute_left)} remaining)")
     typer.echo("MAINTENANCE: OFF" if maint_left is None else f"MAINTENANCE: ON ({fmt_seconds(maint_left)} remaining)")
 
+@app.command()
+def doctor(
+    log_path: str = typer.Option(
+        "/var/log/auth.log",
+        help="Auth log path to test readability (Ubuntu: /var/log/auth.log).",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show more command outputs."),
+    json_out: bool = typer.Option(False, "--json", help="Output JSON only (machine-readable)."),
+    fix_systemd: bool = typer.Option(
+        False,
+        "--fix-systemd",
+        help="Try to daemon-reload + enable --now argus.service (user service).",
+    ),
+    perf: bool = typer.Option(
+        False,
+        "--perf",
+        help="Run safe one-shot performance checks (collectors + detectors).",
+    ),
+    issue: bool = typer.Option(
+        False,
+        "--issue",
+        help="Output Markdown ready to paste in a GitHub issue.",
+    ),
+):
+    """Run ARGUS self-diagnostics (systemd, DB, permissions, tools)."""
+    from argus.doctor import run_doctor
+
+    code = run_doctor(
+        log_path=log_path,
+        service_name="argus.service",
+        verbose=verbose,
+        json_out=json_out,
+        fix_systemd=fix_systemd,
+        perf=perf,
+        issue=issue,
+    )
+    raise typer.Exit(code=code)
+
 
 @app.command()
-def start() -> None:
-    """Start monitor (v1 placeholder)."""
-    set_state("RUNNING")
+def start():
+    """Start Argus via systemd user service."""
+    if not _systemd_available():
+        typer.echo("[argus] systemd user is not available. Use: argus run")
+        raise typer.Exit(code=1)
+
+    r = _systemctl_user(["start", _SERVICE], timeout=3.0)
+    if r is None or r.returncode != 0:
+        err = (r.stderr or "").strip() if r else ""
+        typer.echo("[argus] Failed to start systemd service.")
+        if err:
+            typer.echo(err)
+        typer.echo(f"[argus] Try: systemctl --user status {_SERVICE} --no-pager")
+        raise typer.Exit(code=1)
+
     typer.echo("RUNNING")
 
 
 @app.command()
-def stop() -> None:
-    """Stop monitor (v1 placeholder)."""
-    set_state("STOPPED")
+def stop():
+    """Stop Argus via systemd user service."""
+    if not _systemd_available():
+        typer.echo("[argus] systemd user is not available.")
+        raise typer.Exit(code=1)
+
+    r = _systemctl_user(["stop", _SERVICE], timeout=3.0)
+    if r is None or r.returncode != 0:
+        err = (r.stderr or "").strip() if r else ""
+        typer.echo("[argus] Failed to stop systemd service.")
+        if err:
+            typer.echo(err)
+        raise typer.Exit(code=1)
+
     typer.echo("STOPPED")
 
 
 @app.command()
-def mute(
-    duration: str = typer.Argument("10m", help="Examples: 10m, 30m, 1h"),
-) -> None:
-    """Mute CRITICAL popups for a period."""
+def enable():
+    """Enable + start Argus at login (systemd user)."""
+    if not _systemd_available():
+        typer.echo("[argus] systemd user is not available.")
+        raise typer.Exit(code=1)
+
+    r = _systemctl_user(["enable", "--now", _SERVICE], timeout=4.0)
+    if r is None or r.returncode != 0:
+        err = (r.stderr or "").strip() if r else ""
+        typer.echo("[argus] Failed to enable the service.")
+        if err:
+            typer.echo(err)
+        raise typer.Exit(code=1)
+
+    typer.echo("ENABLED")
+
+
+@app.command()
+def disable():
+    """Disable + stop Argus (systemd user)."""
+    if not _systemd_available():
+        typer.echo("[argus] systemd user is not available.")
+        raise typer.Exit(code=1)
+
+    r = _systemctl_user(["disable", "--now", _SERVICE], timeout=4.0)
+    if r is None or r.returncode != 0:
+        err = (r.stderr or "").strip() if r else ""
+        typer.echo("[argus] Failed to disable the service.")
+        if err:
+            typer.echo(err)
+        raise typer.Exit(code=1)
+
+    typer.echo("DISABLED")
+
+
+@app.command()
+def logs(
+    lines: int = typer.Option(80, "--lines", "-n", help="How many log lines to show."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow logs (live)."),
+):
+    """Show systemd journal logs for Argus service."""
+    cmd = ["journalctl", "--user", "-u", _SERVICE, "--no-pager", "-n", str(lines)]
+    if follow:
+        cmd.append("-f")
+    raise typer.Exit(subprocess.call(cmd))
+
+
+@app.command()
+def mute(duration: str = typer.Argument("10m", help="Example: 10m, 30m, 1h")):
+    """Mute popups (CRITICAL only) for a period."""
     ttl = parse_duration(duration)
     db.set_flag("mute", "1", ttl_seconds=ttl)
     typer.echo(f"MUTE enabled for {duration}")
 
 
 @app.command()
-def maintenance(
-    duration: str = typer.Argument("30m", help="Examples: 30m, 1h"),
-) -> None:
+def maintenance(duration: str = typer.Argument("30m", help="Example: 30m, 1h")):
     """Maintenance mode: reduces noise for a period."""
     ttl = parse_duration(duration)
     db.set_flag("maintenance", "1", ttl_seconds=ttl)
@@ -137,18 +290,9 @@ def maintenance(
 
 @app.command()
 def run(
-    log_path: str = typer.Option(
-        "/var/log/auth.log",
-        help="SSH/auth log path (Ubuntu default: /var/log/auth.log).",
-    ),
-) -> None:
-    """
-    Run the monitor in foreground.
-
-    Includes:
-      - Security: SEC-01..SEC-05 (auth log + periodic scans)
-      - Health: HEA-01/02 (CPU temp), HEA-03 (disk), HEA-04 (services)
-    """
+    log_path: str = typer.Option("/var/log/auth.log", help="SSH log path (Ubuntu: /var/log/auth.log)"),
+):
+    """Run monitor in foreground (used by systemd service too)."""
     set_state("RUNNING")
     try:
         run_authlog_security(log_path=log_path)
@@ -156,31 +300,71 @@ def run(
         set_state("STOPPED")
 
 
+@app.command()
+def sec02(
+    log_path: str = typer.Option("/var/log/auth.log", help="SSH log path (Ubuntu: /var/log/auth.log)"),
+):
+    """Run SEC-02 detector (Success After Fails)."""
+    set_state("RUNNING")
+    detector = SshSuccessAfterFailsDetector()
+
+    try:
+        typer.echo(f"[argus] SEC-02 monitor (auth.log) -> {log_path}")
+        typer.echo("[argus] Press CTRL+C to stop.")
+        time.sleep(0.2)
+
+        for line in tail_file(log_path, from_end=True):
+            result = detector.handle_line(line)
+            if result:
+                severity, entity, message = result
+                db.add_event(code="SEC-02", severity=severity, message=message, entity=str(entity))
+                typer.echo(f"[SEC-02] {severity:<8} {entity}  {message}")
+
+    except PermissionError:
+        typer.echo(f"[argus] Permission denied on {log_path}.")
+        typer.echo("[argus] Typical fix on Ubuntu: add user to group 'adm':")
+        typer.echo("        sudo usermod -aG adm $USER")
+        typer.echo("        then logout/login (or reboot).")
+        raise
+    except KeyboardInterrupt:
+        typer.echo("\n[argus] Stop requested by user (CTRL+C).")
+    finally:
+        set_state("STOPPED")
+
+
+@app.command("events")
+def events(
+    last: int = typer.Option(20, "--last", "-n", help="How many events to show (default 20)"),
+):
+    """Show latest events from DB (debug/dev)."""
+    rows = db.list_events(limit=last)
+    if not rows:
+        typer.echo("No events in DB.")
+        raise typer.Exit()
+
+    for e in rows:
+        ts = datetime.fromtimestamp(int(e["ts"])).strftime("%H:%M:%S")
+        sev = (e.get("severity") or "").upper()
+        code = (e.get("code") or "")
+        msg = (e.get("message") or "").strip()
+        if len(msg) > 140:
+            msg = msg[:137] + "..."
+        typer.echo(f"{ts}  {sev:<8} {code:<6} {msg}")
+
+
 @app.command("report")
 def report(
     n: int = typer.Option(
-        1,
-        "-n",
-        "--last",
-        min=1,
-        help="Generate/print reports for the last N events (batch).",
+        1, "-n", "--last", min=1, help="Generate/print reports for the last N events (batch)."
     ),
     nth: Optional[int] = typer.Option(
-        None,
-        "--nth",
-        min=1,
-        help="Pick the Nth most recent event (1=latest, 2=previous...).",
+        None, "--nth", min=1, help="Pick the Nth most recent event (1=latest, 2=previous...)."
     ),
     code: Optional[str] = typer.Option(
-        None,
-        "--code",
-        help="Filter by event code (e.g., HEA-04, SEC-03).",
+        None, "--code", help="Filter by event code (e.g., HEA-04, SEC-03)."
     ),
     list_only: bool = typer.Option(
-        False,
-        "--list",
-        "-l",
-        help="List saved reports from ~/.local/share/argus/reports and exit.",
+        False, "--list", "-l", help="List saved reports from ~/.local/share/argus/reports and exit."
     ),
 ) -> None:
     """
@@ -249,82 +433,9 @@ def report(
         typer.echo(reporter.render_markdown(e))
 
 
-# ----------------------------
-# Debug commands (clean help)
-# ----------------------------
-
-@debug_app.command("events")
-def debug_events(
-    last: int = typer.Option(20, "--last", "-n", help="Number of events to show (default 20)."),
-) -> None:
-    """Show latest events from DB (debug/dev)."""
-    rows = db.list_events(limit=last)
-    if not rows:
-        typer.echo("No events in DB.")
-        raise typer.Exit(code=0)
-
-    for e in rows:
-        ts = datetime.fromtimestamp(int(e["ts"])).strftime("%H:%M:%S")
-        sev = (e.get("severity") or "").upper()
-        code = (e.get("code") or "")
-        msg = (e.get("message") or "").strip()
-        if len(msg) > 140:
-            msg = msg[:137] + "..."
-        typer.echo(f"{ts}  {sev:<8} {code:<6} {msg}")
+def run_cli() -> None:
+    app()
 
 
-@debug_app.command("sec02")
-def debug_sec02(
-    log_path: str = typer.Option(
-        "/var/log/auth.log",
-        help="SSH/auth log path (Ubuntu default: /var/log/auth.log).",
-    ),
-) -> None:
-    """Run only SEC-02 detector (debug)."""
-    set_state("RUNNING")
-
-    from argus.collectors.authlog import tail_file
-    from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
-
-    detector = SshSuccessAfterFailsDetector()
-
-    try:
-        typer.echo(f"[argus] DEBUG sec02 monitor -> {log_path}")
-        typer.echo("[argus] Press CTRL+C to stop.")
-        time.sleep(0.2)
-
-        for line in tail_file(log_path, from_end=True):
-            result = detector.handle_line(line)
-            if result:
-                severity, entity, message = result
-                db.add_event(code="SEC-02", severity=severity, message=message, entity=str(entity))
-                typer.echo(f"[SEC-02] {severity:<8} {entity}  {message}")
-
-    except PermissionError:
-        typer.echo(f"[argus] Permission denied: {log_path}")
-        typer.echo("[argus] Typical Ubuntu fix: add your user to 'adm':")
-        typer.echo("        sudo usermod -aG adm $USER")
-        typer.echo("        then logout/login (or reboot).")
-        raise
-    except KeyboardInterrupt:
-        typer.echo("\n[argus] Stop requested (CTRL+C).")
-    finally:
-        set_state("STOPPED")
-
-
-# ----------------------------
-# Backward compatible aliases (hidden)
-# ----------------------------
-
-@app.command("events", hidden=True)
-def events_alias(
-    last: int = typer.Option(20, "--last", "-n", help="Number of events to show (default 20)."),
-) -> None:
-    debug_events(last=last)
-
-
-@app.command("sec02", hidden=True)
-def sec02_alias(
-    log_path: str = typer.Option("/var/log/auth.log", help="SSH/auth log path."),
-) -> None:
-    debug_sec02(log_path=log_path)
+if __name__ == "__main__":
+    run_cli()
