@@ -192,6 +192,17 @@ def doctor(
     )
     raise typer.Exit(code=code)
 
+@app.command("notify-test")
+def notify_test() -> None:
+    """Send a CRITICAL desktop notification test (also writes a SYS CRITICAL event)."""
+    from argus.notify_test import run_notification_test
+
+    ok = run_notification_test()
+    if ok:
+        typer.echo("OK: notification backend executed (check your desktop popup).")
+    else:
+        typer.echo("WARN: notification backend not available or failed (no popup).")
+
 
 @app.command()
 def start():

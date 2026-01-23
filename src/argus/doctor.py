@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -15,7 +15,11 @@ import typer
 
 from argus import __version__ as ARGUS_VERSION
 from argus import db, paths
-
+from argus.doctor_notify import (
+    collect_notify_diagnostics,
+    render_notify_issue,
+    render_notify_text,
+)
 
 # ---------------------------
 # Model
@@ -26,7 +30,7 @@ class CheckResult:
     name: str
     status: str  # OK | WARN | FAIL
     detail: str = ""
-    advice: List[str] = None
+    advice: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -84,7 +88,6 @@ def _get_os_release() -> Dict[str, str]:
 
 
 def _pkg_manager() -> str:
-    # best-effort
     if shutil.which("apt-get"):
         return "apt"
     if shutil.which("dnf"):
@@ -102,9 +105,9 @@ def _get_group_names() -> List[str]:
     if not _is_linux():
         return []
     try:
-        import grp
+        import grp  # pylint: disable=import-error
         gids = os.getgroups()
-        out = []
+        out: List[str] = []
         for gid in gids:
             try:
                 out.append(grp.getgrgid(gid).gr_name)
@@ -115,6 +118,10 @@ def _get_group_names() -> List[str]:
         return []
 
 
+# ---------------------------
+# Checks
+# ---------------------------
+
 def _check_python() -> CheckResult:
     py = sys.executable
     ver = ".".join(map(str, sys.version_info[:3]))
@@ -124,7 +131,6 @@ def _check_python() -> CheckResult:
         name="Python runtime",
         status="OK",
         detail=f"python={py}  version={ver}  argus={ARGUS_VERSION}  {venv_txt}",
-        advice=[],
     )
 
 
@@ -137,7 +143,6 @@ def _check_dirs() -> CheckResult:
             name="ARGUS directories",
             status="OK",
             detail=f"~/.local/share/argus exists; reports={rep}",
-            advice=[],
         )
     except Exception as e:
         return CheckResult(
@@ -156,7 +161,6 @@ def _check_config() -> CheckResult:
             name="ARGUS config",
             status="OK",
             detail="Config ensured (argus.config.ensure_config_exists).",
-            advice=[],
         )
     except Exception as e:
         return CheckResult(
@@ -178,7 +182,6 @@ def _check_db() -> CheckResult:
             name="ARGUS database",
             status="OK",
             detail="DB initialized and readable.",
-            advice=[],
         )
     except Exception as e:
         return CheckResult(
@@ -194,7 +197,7 @@ def _check_db() -> CheckResult:
 
 def _check_tools() -> CheckResult:
     needed = ["systemctl", "journalctl", "ip"]
-    nice = ["ss", "notify-send"]
+    nice = ["ss"]  # optional
     missing_needed = [x for x in needed if shutil.which(x) is None]
     missing_nice = [x for x in nice if shutil.which(x) is None]
 
@@ -212,12 +215,6 @@ def _check_tools() -> CheckResult:
 
     if missing_nice:
         detail += f" Optional missing: {', '.join(missing_nice)}"
-        pm = _pkg_manager()
-        if "notify-send" in missing_nice:
-            if pm == "apt":
-                advice.append("Install notifications tool: sudo apt-get update && sudo apt-get install -y libnotify-bin")
-            else:
-                advice.append("Desktop notifications may not work: install a notify-send provider (libnotify).")
         if "ss" in missing_nice:
             advice.append("Listener scan may be limited: install iproute2 (usually provides ss).")
 
@@ -244,7 +241,6 @@ def _check_authlog_readable(log_path: str) -> CheckResult:
             name="auth.log readability",
             status="OK",
             detail=f"Readable: {log_path}",
-            advice=[],
         )
     except PermissionError:
         groups = _get_group_names()
@@ -270,33 +266,54 @@ def _check_authlog_readable(log_path: str) -> CheckResult:
 
 
 def _check_env_for_notifications() -> CheckResult:
-    display = os.environ.get("DISPLAY", "")
+    """
+    Notifications are DBus-session based.
+    DISPLAY is not strictly required (Wayland).
+    We mainly need XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS.
+    """
     dbus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
     xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
+    display = os.environ.get("DISPLAY", "")
+    sess = os.environ.get("XDG_SESSION_TYPE", "")
 
-    missing = []
-    if not display:
-        missing.append("DISPLAY")
-    if not dbus:
-        missing.append("DBUS_SESSION_BUS_ADDRESS")
+    missing: List[str] = []
     if not xdg:
         missing.append("XDG_RUNTIME_DIR")
+    if not dbus:
+        missing.append("DBUS_SESSION_BUS_ADDRESS")
 
-    if not missing:
+    has_gui_hint = bool(wayland or display or sess)
+
+    if not missing and has_gui_hint:
         return CheckResult(
             name="Desktop session env",
             status="OK",
-            detail="DISPLAY/DBUS/XDG env present (good for notifications).",
-            advice=[],
+            detail=f"DBUS/XDG present; session={sess or '?'} wayland={wayland or '(no)'} display={display or '(no)'}",
+        )
+
+    if not missing and not has_gui_hint:
+        return CheckResult(
+            name="Desktop session env",
+            status="WARN",
+            detail="DBUS/XDG present, but no GUI hints (WAYLAND/DISPLAY/XDG_SESSION_TYPE). Headless runs may not show popups.",
+            advice=[
+                "If you're running the systemd --user service inside a graphical login, ignore this.",
+                "Quick test: argus notify-test",
+            ],
         )
 
     return CheckResult(
         name="Desktop session env",
         status="WARN",
-        detail=f"Missing env: {', '.join(missing)} (may affect notifications when running as a service).",
+        detail=f"Missing env: {', '.join(missing)} (may break desktop notifications in systemd --user service).",
         advice=[
-            "If notifications don't show from the systemd user service:",
-            "  systemctl --user import-environment DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR",
+            "Recommended fix (systemd --user override):",
+            "  systemctl --user edit argus.service",
+            "  [Service]",
+            "  Environment=XDG_RUNTIME_DIR=%t",
+            "  Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus",
+            "  systemctl --user daemon-reload",
             "  systemctl --user restart argus.service",
         ],
     )
@@ -308,7 +325,6 @@ def _check_systemd_user_service(service_name: str, fix_systemd: bool, verbose: b
             name="systemd user service",
             status="WARN",
             detail="Not running on Linux (systemd user checks skipped).",
-            advice=[],
         )
 
     if shutil.which("systemctl") is None:
@@ -441,7 +457,7 @@ def _run_perf() -> List[PerfResult]:
         return list(det.poll(snap))
 
     def det_sec_sample():
-        # smoke test parsing (no events expected necessarily)
+        # smoke test parsing
         from argus.detectors.sec01_ssh import SshBruteForceDetector
         from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
         from argus.detectors.sec03_sudo import SudoActivityDetector
@@ -484,13 +500,22 @@ def _run_perf() -> List[PerfResult]:
 # Copy/paste fixes
 # ---------------------------
 
-def _fix_blocks(results: List[CheckResult]) -> List[Tuple[str, List[str]]]:
+def _fix_blocks(results: List[CheckResult], notify_diag: Any) -> List[Tuple[str, List[str]]]:
     """
     Returns a list of (title, bash_lines) to show as copy/paste fixes.
     Only include blocks that are relevant to WARN/FAIL.
     """
     blocks: List[Tuple[str, List[str]]] = []
     by_name = {r.name: r for r in results}
+
+    # notifications (DBus)
+    try:
+        if getattr(notify_diag, "ok", True) is False:
+            fixes = list(getattr(notify_diag, "fixes", []) or [])
+            if fixes:
+                blocks.append(("Fix desktop notifications (DBus / systemd --user)", fixes))
+    except Exception:
+        pass
 
     # auth.log
     r = by_name.get("auth.log readability")
@@ -525,37 +550,18 @@ def _fix_blocks(results: List[CheckResult]) -> List[Tuple[str, List[str]]]:
     if r and r.status.upper() == "WARN":
         blocks.append(
             (
-                "Import session env for notifications (systemd --user)",
+                "Set DBus session env in systemd --user (recommended)",
                 [
-                    "systemctl --user import-environment DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR",
+                    "systemctl --user edit argus.service",
+                    "# add:",
+                    "# [Service]",
+                    "# Environment=XDG_RUNTIME_DIR=%t",
+                    "# Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus",
+                    "systemctl --user daemon-reload",
                     "systemctl --user restart argus.service",
                 ],
             )
         )
-
-    # notify-send tool missing (from System tools WARN detail)
-    r = by_name.get("System tools")
-    if r and r.status.upper() == "WARN" and "notify-send" in (r.detail or ""):
-        pm = _pkg_manager()
-        if pm == "apt":
-            blocks.append(
-                (
-                    "Install notify-send (Ubuntu/Debian)",
-                    [
-                        "sudo apt-get update",
-                        "sudo apt-get install -y libnotify-bin",
-                    ],
-                )
-            )
-        else:
-            blocks.append(
-                (
-                    "Install notify-send provider (libnotify)",
-                    [
-                        "# install 'libnotify' / 'notify-send' for your distro",
-                    ],
-                )
-            )
 
     return blocks
 
@@ -583,6 +589,7 @@ def _issue_markdown(
     lines: List[str] = []
     lines.append("### ARGUS Doctor Report")
     lines.append("")
+
     lines.append("**Environment**")
     lines.append("")
     lines.append("```text")
@@ -662,6 +669,7 @@ def run_doctor(
     """
     results: List[CheckResult] = []
 
+    # Core checks
     results.append(_check_python())
     results.append(_check_dirs())
     results.append(_check_config())
@@ -670,6 +678,21 @@ def run_doctor(
     results.append(_check_authlog_readable(log_path))
     results.append(_check_env_for_notifications())
     results.append(_check_systemd_user_service(service_name, fix_systemd=fix_systemd, verbose=verbose))
+
+    # Notifications diagnostics (DBus)
+    notify_diag = collect_notify_diagnostics(service_name=service_name)
+    results.append(
+        CheckResult(
+            name="Desktop notifications (DBus)",
+            status="OK" if getattr(notify_diag, "ok", False) else "WARN",
+            detail=f"org.freedesktop.Notifications: {getattr(notify_diag, 'server', 'unknown')}",
+            advice=(
+                []
+                if getattr(notify_diag, "ok", False)
+                else (list(getattr(notify_diag, "problems", []) or [])[:6] + ["Quick test: argus notify-test"])
+            ),
+        )
+    )
 
     perf_results: Optional[List[PerfResult]] = None
     if perf:
@@ -680,7 +703,7 @@ def run_doctor(
     has_warn = any(r.status.upper() == "WARN" for r in results)
     exit_code = 2 if has_fail else (1 if has_warn else 0)
 
-    fixes = _fix_blocks(results)
+    fixes = _fix_blocks(results, notify_diag)
 
     if json_out:
         payload = {
@@ -690,12 +713,21 @@ def run_doctor(
             "results": [r.to_dict() for r in results],
             "perf": [p.to_dict() for p in perf_results] if perf_results is not None else None,
             "fixes": [{"title": t, "commands": c} for t, c in fixes],
+            "notifications": {
+                "ok": getattr(notify_diag, "ok", False),
+                "server": getattr(notify_diag, "server", "unknown"),
+                "env": getattr(notify_diag, "env", {}) or {},
+                "problems": getattr(notify_diag, "problems", []) or [],
+                "fixes": getattr(notify_diag, "fixes", []) or [],
+            },
         }
         typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
         return exit_code
 
     if issue:
-        typer.echo(_issue_markdown(results, perf_results, fixes))
+        md = _issue_markdown(results, perf_results, fixes)
+        md += "\n\n" + "\n".join(render_notify_issue(notify_diag))
+        typer.echo(md)
         return exit_code
 
     # Human output
@@ -707,11 +739,18 @@ def run_doctor(
         if r.detail:
             for ln in str(r.detail).splitlines():
                 typer.echo(f"    {ln}")
-        adv = r.advice or []
-        if adv:
+        if r.advice:
             typer.echo("    Suggested:")
-            for a in adv:
+            for a in r.advice:
                 typer.echo(f"      - {a}")
+        typer.echo("")
+
+    # Extra notification details (only if not OK)
+    if getattr(notify_diag, "ok", False) is False:
+        typer.echo("Notifications (details)")
+        typer.echo("-" * 60)
+        for ln in render_notify_text(notify_diag, show_fixes=True):
+            typer.echo(ln)
         typer.echo("")
 
     if perf_results is not None:
@@ -747,3 +786,6 @@ def run_doctor(
         typer.echo("❌ Failures detected (fix items above).")
 
     return exit_code
+
+
+__all__ = ["run_doctor"]

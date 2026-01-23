@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import signal
 import threading
 import time
 import typer
@@ -9,6 +8,8 @@ from argus import db
 from argus.collectors.authlog import tail_file
 from argus.collectors.temperature import read_cpu_temp_c
 from argus.collectors.memory import snapshot as memory_snapshot
+
+from argus.desktop_notify import DesktopNotifier, build_critical_notification
 
 from argus.detectors.hea_disk import DiskUsageDetector
 from argus.detectors.hea_services import HeaServicesDetector
@@ -22,14 +23,37 @@ from argus.detectors.sec04_listen import ListeningPortDetector
 from argus.detectors.sec05_file_integrity import FileIntegrityDetector
 
 
+# One notifier instance shared across threads (includes throttling + safe execution)
+_NOTIFIER = DesktopNotifier(min_interval_s=60, timeout_ms=9000)
+
+
+def _is_muted() -> bool:
+    # MUTE silenzia SOLO i popup CRITICAL (come da CLI)
+    return db.get_flag("mute") is not None
+
+
+def _maybe_notify(code: str, severity: str, entity: str, message: str) -> None:
+    try:
+        if (severity or "").upper() != "CRITICAL":
+            return
+        if _is_muted():
+            return
+        title, body, key = build_critical_notification(code, entity, message)
+        _NOTIFIER.notify(title, body, urgency="critical", key=key)
+    except Exception:
+        # Never crash the monitor because of notifications
+        return
+
+
 def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = ListeningPortDetector()
-    det.poll()  # baseline
+    det.poll()  # baseline (no events)
 
     while not stop.is_set():
         try:
             for sev, entity, msg in det.poll():
                 db.add_event(code="SEC-04", severity=sev, message=msg, entity=entity)
+                _maybe_notify("SEC-04", str(sev), str(entity), str(msg))
                 typer.echo(f"[SEC-04] {sev:<8} {entity}  {msg}")
         except Exception as e:
             typer.echo(f"[SEC-04] ERROR    listen-scan failed: {e!r}")
@@ -39,12 +63,13 @@ def _sec04_loop(stop: threading.Event, interval_s: int = 30) -> None:
 
 def _sec05_loop(stop: threading.Event, interval_s: int = 10) -> None:
     det = FileIntegrityDetector()
-    det.poll()  # baseline
+    det.poll()  # baseline (no events)
 
     while not stop.is_set():
         try:
             for sev, entity, msg in det.poll():
                 db.add_event(code="SEC-05", severity=sev, message=msg, entity=entity)
+                _maybe_notify("SEC-05", str(sev), str(entity), str(msg))
                 typer.echo(f"[SEC-05] {sev:<8} {entity}  {msg}")
         except Exception as e:
             typer.echo(f"[SEC-05] ERROR    integrity-scan failed: {e!r}")
@@ -61,6 +86,7 @@ def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
             if t is not None:
                 for code, sev, entity, msg in det.poll(t):
                     db.add_event(code=code, severity=sev, message=msg, entity=entity)
+                    _maybe_notify(str(code), str(sev), str(entity), str(msg))
                     typer.echo(f"[{code}] {sev:<8} {entity}  {msg}")
         except Exception as e:
             typer.echo(f"[HEA-TEMP] ERROR    temp-scan failed: {e!r}")
@@ -70,11 +96,12 @@ def _hea_temp_loop(stop: threading.Event, interval_s: int = 5) -> None:
 
 def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
     det = DiskUsageDetector()
-    det.poll()  # baseline
+    det.poll()  # prime poll (no events)
 
     while not stop.is_set():
         try:
-            for sev, entity, msg, details_json in det.poll():
+            for item in det.poll():
+                sev, entity, msg, details_json = item
                 db.add_event(
                     code="HEA-03",
                     severity=sev,
@@ -82,6 +109,7 @@ def _hea03_loop(stop: threading.Event, interval_s: int = 30) -> None:
                     entity=str(entity),
                     details_json=details_json,
                 )
+                _maybe_notify("HEA-03", str(sev), str(entity), str(msg))
                 typer.echo(f"[HEA-03] {sev:<8} {entity}  {msg}")
         except Exception as e:
             typer.echo(f"[HEA-03] ERROR    disk-scan failed: {e!r}")
@@ -96,7 +124,7 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
     """
     det = HeaServicesDetector(interval_s=15)
 
-    # baseline best-effort
+    # baseline if detector supports it
     if hasattr(det, "poll"):
         try:
             _ = list(det.poll())  # type: ignore[attr-defined]
@@ -109,6 +137,7 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
                 for item in det.poll():  # type: ignore[attr-defined]
                     if not item:
                         continue
+
                     if len(item) == 3:
                         sev, entity, msg = item
                         code = "HEA-04"
@@ -118,9 +147,11 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
                         continue
 
                     db.add_event(code=str(code), severity=str(sev), message=str(msg), entity=str(entity))
+                    _maybe_notify(str(code), str(sev), str(entity), str(msg))
                     typer.echo(f"[{code}] {str(sev):<8} {entity}  {msg}")
             else:
-                det.tick(int(time.time()))  # type: ignore[attr-defined]
+                now_ts = int(time.time())
+                det.tick(now_ts)  # type: ignore[attr-defined]
         except Exception as e:
             typer.echo(f"[HEA-04] ERROR    service-scan failed: {e!r}")
 
@@ -128,10 +159,12 @@ def _hea04_loop(stop: threading.Event, interval_s: int = 1) -> None:
 
 
 def _hea05_loop(stop: threading.Event, interval_s: int = 5) -> None:
-    """HEA-05: Memory pressure (MemAvailable + swap thrashing)."""
+    """
+    HEA-05: Memory pressure (MemAvailable + swap thrashing)
+    """
     det = MemoryPressureDetector()
 
-    # baseline
+    # baseline (no events)
     try:
         det.poll(memory_snapshot())
     except Exception:
@@ -148,6 +181,7 @@ def _hea05_loop(stop: threading.Event, interval_s: int = 5) -> None:
                     entity=str(entity),
                     details_json=details_json,
                 )
+                _maybe_notify("HEA-05", str(sev), str(entity), str(msg))
                 typer.echo(f"[HEA-05] {sev:<8} {entity}  {msg}")
         except Exception as e:
             typer.echo(f"[HEA-05] ERROR    memory-scan failed: {e!r}")
@@ -174,21 +208,10 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
     ]
 
     typer.echo(f"[argus] Monitor: auth.log -> {log_path}")
-    typer.echo("[argus] Press CTRL+C to stop (systemd stop sends SIGTERM).")
+    typer.echo("[argus] Press CTRL+C to stop.")
 
     stop = threading.Event()
 
-    # ---- systemd stop support (SIGTERM) ----
-    def _handle_term(signum, frame):
-        raise KeyboardInterrupt()
-
-    old_term = signal.getsignal(signal.SIGTERM)
-    try:
-        signal.signal(signal.SIGTERM, _handle_term)
-    except Exception:
-        old_term = None  # not supported
-
-    # background threads
     t_sec04 = threading.Thread(target=_sec04_loop, args=(stop,), daemon=True)
     t_sec05 = threading.Thread(target=_sec05_loop, args=(stop,), daemon=True)
     t_temp  = threading.Thread(target=_hea_temp_loop, args=(stop,), daemon=True)
@@ -219,16 +242,17 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
 
                 severity, entity, message = res
                 db.add_event(code=code, severity=severity, message=message, entity=str(entity))
+                _maybe_notify(code, str(severity), str(entity), str(message))
                 typer.echo(f"[{code}] {severity:<8} {entity}  {message}")
 
     except PermissionError:
         typer.echo(f"[argus] Permission denied on {log_path}.")
-        typer.echo("[argus] Typical fix on Ubuntu: add user to group 'adm':")
+        typer.echo("[argus] Typical Ubuntu fix: add user to 'adm' group:")
         typer.echo("        sudo usermod -aG adm $USER")
         typer.echo("        then logout/login (or reboot).")
         raise
     except KeyboardInterrupt:
-        typer.echo("\n[argus] Stop requested (SIGTERM/CTRL+C).")
+        typer.echo("\n[argus] Stop requested by user. (CTRL+C)")
     finally:
         stop.set()
         t_sec04.join(timeout=2)
@@ -237,9 +261,3 @@ def run_authlog_security(log_path: str = "/var/log/auth.log") -> None:
         t_disk.join(timeout=2)
         t_svc.join(timeout=2)
         t_mem.join(timeout=2)
-
-        if old_term is not None:
-            try:
-                signal.signal(signal.SIGTERM, old_term)
-            except Exception:
-                pass
