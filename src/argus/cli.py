@@ -14,7 +14,13 @@ from argus.collectors.authlog import tail_file
 from argus.detectors.sec02_ssh import SshSuccessAfterFailsDetector
 from argus.monitor import run_authlog_security
 
-app = typer.Typer(add_completion=False, invoke_without_command=True)
+app = typer.Typer(
+    add_completion=False,
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    epilog="Tip: use `argus COMMAND -h` (or `--help`) to see all options and examples for that command.",
+)
+
 
 _DUR_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.IGNORECASE)
 _SERVICE = "argus.service"
@@ -159,7 +165,7 @@ def doctor(
     fix_systemd: bool = typer.Option(
         False,
         "--fix-systemd",
-        help="Try to daemon-reload + enable --now argus.service (user service).",
+        help="attempt to fix common systemd user service issues.",
     ),
     perf: bool = typer.Option(
         False,
@@ -172,7 +178,7 @@ def doctor(
         help="Output Markdown ready to paste in a GitHub issue.",
     ),
 ):
-    """Run ARGUS self-diagnostics (systemd, DB, permissions, tools)."""
+    """Run ARGUS self-diagnostics. Use `argus doctor -h` for --perf and --issue."""
     from argus.doctor import run_doctor
 
     code = run_doctor(
@@ -265,7 +271,7 @@ def logs(
     lines: int = typer.Option(80, "--lines", "-n", help="How many log lines to show."),
     follow: bool = typer.Option(False, "--follow", "-f", help="Follow logs (live)."),
 ):
-    """Show systemd journal logs for Argus service."""
+    """Show systemd journal logs for Argus service. Use `argus logs -h` for options."""
     cmd = ["journalctl", "--user", "-u", _SERVICE, "--no-pager", "-n", str(lines)]
     if follow:
         cmd.append("-f")
@@ -336,7 +342,7 @@ def sec02(
 def events(
     last: int = typer.Option(20, "--last", "-n", help="How many events to show (default 20)"),
 ):
-    """Show latest events from DB (debug/dev)."""
+    """Show latest events from DB (debug/dev). Use `argus events -h` to see filters/options."""
     rows = db.list_events(limit=last)
     if not rows:
         typer.echo("No events in DB.")
@@ -368,9 +374,9 @@ def report(
     ),
 ) -> None:
     """
-    Print a markdown report for events.
+    Print a markdown report for events. Use `argus report -h` to see filters/options.
 
-    - Default: report for the latest event
+    - Default: report for the latest events
     - --nth: report for the Nth latest event (single)
     - -n/--last: batch mode (last N events)
     - --code: filter by code, works with both modes
