@@ -277,7 +277,10 @@ class ArgusApp(App):
     #app { height: 1fr; }
     #hdr { height: 3; }
     #overlay { height: auto; }
-    #summary { height: auto; padding: 1 0; }
+
+    /* SUMMARY: scrollable + fixed height (prevents shrinking feed/details) */
+    #summary_box { height: 16; border: round $surface; }
+    #summary { padding: 1 2; }
 
     #main { height: 1fr; }
     #feed { width: 1fr; border: round $surface; }
@@ -294,18 +297,20 @@ class ArgusApp(App):
     .stack #main { layout: vertical; }
     .stack #feed { width: 1fr; height: 2fr; }
     .stack #detail_box { width: 1fr; height: 1fr; }
+
     .short #overlay { display: none; }
     .tiny #overlay { display: none; }
-    .tiny #summary { display: none; }
+    .tiny #summary_box { display: none; }
     .tiny #detail_box { display: none; }
+    .tiny #hdr { height: 2; }
 
     /* Responsive helpers */
     .narrow #detail_box { display: none; }
-    .narrow #summary { display: none; }
-    .short #overlay { display: none; }
-    .tiny #overlay { display: none; }
-    .tiny #summary { display: none; }
-    .tiny #hdr { height: 2; }
+    .narrow #summary_box { display: none; }
+
+    /* Make summary smaller on short screens */
+    .short #summary_box { height: 10; }
+    .stack #summary_box { height: 12; }
     """
 
     ui_mode = reactive("splash")         # splash|main
@@ -346,7 +351,11 @@ class ArgusApp(App):
         with Container(id="app"):
             yield Static("", id="hdr")
             yield Static("", id="overlay")
-            yield Static("", id="summary")
+
+            # SUMMARY is now a scrollable container (so it won't grow forever)
+            with VerticalScroll(id="summary_box"):
+                yield Static("", id="summary")
+
             with Container(id="main"):
                 yield ListView(id="feed")
                 with VerticalScroll(id="detail_box"):
@@ -357,6 +366,16 @@ class ArgusApp(App):
         db.init_db()
         self._apply_global_visibility()
         self._render_splash(force_banner=True)
+
+        # force scrollbar visible on summary + details
+        try:
+            self.query_one("#summary_box", VerticalScroll).show_vertical_scrollbar = True
+        except Exception:
+            pass
+        try:
+            self.query_one("#detail_box", VerticalScroll).show_vertical_scrollbar = True
+        except Exception:
+            pass
 
         self.set_interval(0.06, self._tick_splash)  # splash animation
         self.set_interval(1.0, self._refresh)       # main refresh
@@ -634,15 +653,16 @@ class ArgusApp(App):
         self._update_footerbar()
 
     def _apply_visibility(self) -> None:
-        summary = self.query_one("#summary", Static)
+        summary_box = self.query_one("#summary_box", VerticalScroll)
         detail_box = self.query_one("#detail_box", VerticalScroll)
 
         if self.view_mode == "minimal":
-            summary.add_class("hidden")
+            summary_box.add_class("hidden")
             detail_box.add_class("hidden")
             return
 
-        summary.remove_class("hidden")
+        summary_box.remove_class("hidden")
+
         prof = getattr(self, "_layout_profile", "wide")
         if self.show_details and (self.size.width >= 100 or prof == "stack"):
             detail_box.remove_class("hidden")
@@ -912,7 +932,10 @@ class ArgusApp(App):
         if str(do_body).endswith("\n"):
             do_body = Text(str(do_body).rstrip("\n"))
 
-        hint = Text("Enter: open saved report  •  Esc: back to details  •  H: simple/technical  •  T: Trust (SEC-04)", style="dim")
+        hint = Text(
+            "Enter: open saved report  •  Esc: back to details  •  H: simple/technical  •  T: Trust (SEC-04)",
+            style="dim",
+        )
 
         if self.detail_mode == "simple":
             content = Group(
@@ -1173,3 +1196,11 @@ class ArgusApp(App):
         self._apply_visibility()
         self._update_detail()
         self._update_footerbar()
+
+
+def run_tui() -> None:
+    ArgusApp().run()
+
+
+if __name__ == "__main__":
+    run_tui()
