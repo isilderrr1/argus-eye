@@ -47,7 +47,7 @@ pipx installs CLI apps in isolated environments (perfect for tools like ARGUS).
 
 ```bash
 sudo apt update
-sudo apt install -y pipx
+sudo apt install -y git pipx
 pipx ensurepath
 ```
 
@@ -73,6 +73,7 @@ pipx upgrade argus-eye
 
 ```bash
 argus doctor
+argus -h
 ```
 
 2) Launch the TUI (default command):
