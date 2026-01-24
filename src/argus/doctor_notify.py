@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 @dataclass
@@ -85,8 +85,6 @@ def collect_notify_diagnostics(service_name: str = "argus.service") -> NotifyDia
     ok_server, server_info, server_problems = _probe_notifications_server()
     problems.extend(server_problems)
 
-    # Success criteria: server reachable (best signal).
-    ok = ok_server and (not problems or True)
 
     # Fixes: keep them copy/paste-ready, optimized for systemd --user
     fixes.append("# Test a CRITICAL popup now:")
