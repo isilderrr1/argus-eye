@@ -30,3 +30,8 @@ src/argus/tui.py.bak_*
 *.bak
 *.bak_*
 *.tmp
+
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

@@ -1,0 +1,28 @@
+name: Bug report
+description: Something isn't working
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! If possible, paste `argus doctor --issue` output (remove sensitive data).
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: What did you do and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1) ...
+        2) ...
+        3) ...
+  - type: textarea
+    attributes:
+      label: Output of `argus doctor --issue`
+      render: text
+    validations:
+      required: true
