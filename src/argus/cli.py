@@ -21,7 +21,6 @@ app = typer.Typer(
     epilog="Tip: use `argus COMMAND -h` (or `--help`) to see all options and examples for that command.",
 )
 
-
 _DUR_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.IGNORECASE)
 _SERVICE = "argus.service"
 
@@ -77,7 +76,6 @@ def _systemd_available() -> bool:
     r = _systemctl_user(["is-system-running"], timeout=1.5)
     if r is None:
         return False
-    # If systemd user bus isn't available you typically see "Failed to connect to bus"
     if (r.stderr or "").lower().find("failed to connect to bus") >= 0:
         return False
     return True
@@ -99,6 +97,21 @@ def _service_info() -> Optional[Dict[str, str]]:
             k, v = ln.split("=", 1)
             info[k.strip()] = v.strip()
     return info
+
+
+def _ensure_user_unit_installed(log_path: str = "/var/log/auth.log", force: bool = False) -> None:
+    """
+    Make sure ~/.config/systemd/user/argus.service exists and is pipx-friendly.
+    If an old/custom unit exists and force=False, we do NOT overwrite it.
+    """
+    from argus.systemd_unit import install_user_unit
+
+    unit_path, action = install_user_unit(log_path=log_path, force=force)
+    if action in ("installed", "updated"):
+        typer.echo(f"[argus] systemd unit {action}: {unit_path}")
+    else:
+        # kept: unit exists (maybe custom). We keep quiet unless force requested.
+        pass
 
 
 @app.callback(invoke_without_command=True)
@@ -125,7 +138,6 @@ def main(
 @app.command()
 def status():
     """Show state (RUNNING/STOPPED) + runtime flags."""
-    # Prefer systemd user service state when available
     info = _service_info()
     if info:
         active = (info.get("ActiveState") or "unknown").lower()
@@ -154,6 +166,7 @@ def status():
     typer.echo("MUTE: OFF" if mute_left is None else f"MUTE: ON ({fmt_seconds(mute_left)} remaining)")
     typer.echo("MAINTENANCE: OFF" if maint_left is None else f"MAINTENANCE: ON ({fmt_seconds(maint_left)} remaining)")
 
+
 @app.command()
 def doctor(
     log_path: str = typer.Option(
@@ -165,7 +178,7 @@ def doctor(
     fix_systemd: bool = typer.Option(
         False,
         "--fix-systemd",
-        help="attempt to fix common systemd user service issues.",
+        help="Attempt to fix common systemd user service issues (reload + enable/start).",
     ),
     perf: bool = typer.Option(
         False,
@@ -192,6 +205,7 @@ def doctor(
     )
     raise typer.Exit(code=code)
 
+
 @app.command("notify-test")
 def notify_test() -> None:
     """Send a CRITICAL desktop notification test (also writes a SYS CRITICAL event)."""
@@ -202,6 +216,38 @@ def notify_test() -> None:
         typer.echo("OK: notification backend executed (check your desktop popup).")
     else:
         typer.echo("WARN: notification backend not available or failed (no popup).")
+
+
+@app.command("install-service")
+def install_service(
+    log_path: str = typer.Option("/var/log/auth.log", help="Log path used by `argus run` inside the service."),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing unit file if it differs."),
+    show: bool = typer.Option(False, "--show", help="Print the unit file content and exit (no install)."),
+):
+    """
+    Install/update systemd --user unit (pipx-friendly: NOT tied to a repo path).
+
+    Typical:
+      argus install-service --force
+      systemctl --user daemon-reload
+      systemctl --user enable --now argus.service
+    """
+    from argus.systemd_unit import render_user_unit, install_user_unit
+
+    if show:
+        typer.echo(render_user_unit(log_path=log_path))
+        raise typer.Exit(code=0)
+
+    unit_path, action = install_user_unit(log_path=log_path, force=force)
+    if action == "kept" and not force:
+        typer.echo(f"[argus] Unit already exists and differs: {unit_path}")
+        typer.echo("[argus] Not overwriting. Use: argus install-service --force")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"[argus] systemd unit {action}: {unit_path}")
+    typer.echo("[argus] Next:")
+    typer.echo("  systemctl --user daemon-reload")
+    typer.echo("  systemctl --user enable --now argus.service")
 
 
 @app.command()
@@ -242,11 +288,19 @@ def stop():
 
 
 @app.command()
-def enable():
+def enable(
+    log_path: str = typer.Option("/var/log/auth.log", help="Log path used by the service (default: /var/log/auth.log)."),
+    force_unit: bool = typer.Option(False, "--force-unit", help="Overwrite existing unit file if needed."),
+):
     """Enable + start Argus at login (systemd user)."""
     if not _systemd_available():
         typer.echo("[argus] systemd user is not available.")
         raise typer.Exit(code=1)
+
+    # Ensure we have a pipx-friendly unit (install if missing; overwrite only if asked)
+    _ensure_user_unit_installed(log_path=log_path, force=force_unit)
+
+    _systemctl_user(["daemon-reload"], timeout=3.0)
 
     r = _systemctl_user(["enable", "--now", _SERVICE], timeout=4.0)
     if r is None or r.returncode != 0:
@@ -371,18 +425,10 @@ def events(
 
 @app.command("report")
 def report(
-    n: int = typer.Option(
-        1, "-n", "--last", min=1, help="Generate/print reports for the last N events (batch)."
-    ),
-    nth: Optional[int] = typer.Option(
-        None, "--nth", min=1, help="Pick the Nth most recent event (1=latest, 2=previous...)."
-    ),
-    code: Optional[str] = typer.Option(
-        None, "--code", help="Filter by event code (e.g., HEA-04, SEC-03)."
-    ),
-    list_only: bool = typer.Option(
-        False, "--list", "-l", help="List saved reports from ~/.local/share/argus/reports and exit."
-    ),
+    n: int = typer.Option(1, "-n", "--last", min=1, help="Generate/print reports for the last N events (batch)."),
+    nth: Optional[int] = typer.Option(None, "--nth", min=1, help="Pick the Nth most recent event (1=latest, 2=previous...)."),
+    code: Optional[str] = typer.Option(None, "--code", help="Filter by event code (e.g., HEA-04, SEC-03)."),
+    list_only: bool = typer.Option(False, "--list", "-l", help="List saved reports from ~/.local/share/argus/reports and exit."),
 ) -> None:
     """
     Print a markdown report for events. Use `argus report -h` to see filters/options.
@@ -397,7 +443,6 @@ def report(
 
     db.init_db()
 
-    # LIST saved reports (from reports dir), do not touch events DB
     if list_only:
         reps = reporter.list_saved_reports(code=code)
         if not reps:
@@ -407,15 +452,11 @@ def report(
         typer.echo(f"Saved reports: {len(reps)}")
         typer.echo("Idx  Time                Code    Severity   Entity              File")
         typer.echo("---- ------------------- ------- ---------- ------------------- ------------------------------")
-
         for i, r in enumerate(reps, start=1):
             ent = (r.get("entity") or "")[:19]
-            typer.echo(
-                f"{i:>3}  {r['time']:<19} {r['code']:<7} {r['severity']:<10} {ent:<19} {r['file']}"
-            )
+            typer.echo(f"{i:>3}  {r['time']:<19} {r['code']:<7} {r['severity']:<10} {ent:<19} {r['file']}")
         raise typer.Exit(code=0)
 
-    # Otherwise: generate/print report(s) from events DB
     events = db.list_events(limit=500)
 
     if code:
@@ -426,23 +467,18 @@ def report(
         typer.echo("No events found.")
         raise typer.Exit(code=1)
 
-    # SINGLE PICK mode
     if nth is not None:
         idx = nth - 1
         if idx < 0 or idx >= len(events):
             typer.echo(f"Not enough events to pick --nth {nth} (available: {len(events)}).")
             raise typer.Exit(code=1)
-
-        e = events[idx]
-        typer.echo(reporter.render_markdown(e))
+        typer.echo(reporter.render_markdown(events[idx]))
         raise typer.Exit(code=0)
 
-    # Default single (latest)
     if n == 1:
         typer.echo(reporter.render_markdown(events[0]))
         raise typer.Exit(code=0)
 
-    # BATCH mode (last N)
     picked = events[:n]
     for i, e in enumerate(picked, start=1):
         if i > 1:
