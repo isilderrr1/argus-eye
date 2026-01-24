@@ -54,7 +54,7 @@ pipx ensurepath
 ### 2) Install ARGUS-Eye (stable tag)
 
 ```bash
-pipx install "git+https://github.com/isilderrr1/argus-eye.git@v0.1.0"
+pipx install "git+https://github.com/isilderrr1/argus-eye.git@v0.1.1"
 ```
 
 Upgrade later:
@@ -63,7 +63,7 @@ Upgrade later:
 pipx upgrade argus-eye
 ```
 
-> If you want the latest development version, replace `@v0.1.0` with `@master`.
+> If you want the latest development version, replace `@v0.1.1` with `@master`.
 
 ---
 
